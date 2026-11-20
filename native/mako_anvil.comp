@@ -1,0 +1,83 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, binding = 2) buffer ModelInput { uint words[]; } inputTensor;
+layout(binding = 5) uniform sampler2D alignedImages;
+layout(push_constant) uniform CaptureParams { uint tag; uint motion; uint frameId; } capture;
+const ivec2 size = ivec2(1280, 720);
+
+#ifdef PACK
+layout(binding = 0) uniform sampler2D previousImage;
+layout(binding = 1) uniform sampler2D currentImage;
+
+void main()
+{
+    ivec2 block = ivec2(gl_GlobalInvocationID.xy);
+    if (block.x >= size.x / 4 || block.y >= size.y)
+        return;
+    uint offset = uint(block.y * (size.x / 4) + block.x) * 6u;
+    uint packed[6] = uint[6](0u, 0u, 0u, 0u, 0u, 0u);
+    for (int i = 0; i < 4; ++i) {
+        ivec2 pixel = ivec2(block.x * 4 + i, block.y);
+        // The swapchain in this path supplies SDR code values. Both textures
+        // are already in RGBA order after the renderer's color-format blit.
+        vec3 oldColor = capture.motion != 0u ? texelFetch(alignedImages, pixel, 0).rgb
+                                            : texelFetch(previousImage, pixel, 0).rgb;
+        vec3 newColor = capture.motion != 0u ? texelFetch(alignedImages, pixel + ivec2(size.x, 0), 0).rgb
+                                            : texelFetch(currentImage, pixel, 0).rgb;
+        uvec3 a = uvec3(round(clamp(oldColor, 0.0, 1.0) * 255.0));
+        uvec3 b = uvec3(round(clamp(newColor, 0.0, 1.0) * 255.0));
+        uint texels[6] = uint[6](a.r, a.g, a.b, b.r, b.g, b.b);
+        for (int c = 0; c < 6; ++c) {
+            int index = i * 6 + c;
+            packed[index / 4] |= texels[c] << ((index & 3) * 8);
+        }
+    }
+    for (int word = 0; word < 6; ++word)
+        inputTensor.words[offset + uint(word)] = packed[word];
+}
+#else
+layout(std430, binding = 3) readonly buffer ModelOutput { uint words[]; } residualTensor;
+#ifdef WIDE
+layout(binding = 4, rgba16f) writeonly uniform image2D generated;
+#else
+layout(binding = 4, rgba8) writeonly uniform image2D generated;
+#endif
+
+float byteAt(uint word, uint index)
+{
+    return float((word >> ((index & 3u) * 8u)) & 255u);
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, size)))
+        return;
+    if (capture.tag != 0u && pixel.x >= 96 && pixel.x < 144 && pixel.y >= 48 && pixel.y < 68) {
+        const vec3 left = vec3(0.85, 0.20, 0.80);
+        const vec3 right = vec3(0.20, 0.85, 0.80);
+        imageStore(generated, pixel, vec4(pixel.x < 120 ? left : right, 1.0));
+        return;
+    }
+    if (capture.tag != 0u && pixel.x >= 96 && pixel.x < 352 && pixel.y >= 656 && pixel.y < 688) {
+        uint bit = uint(pixel.x - 96) / 8u;
+        uint polarity = pixel.y >= 672 ? 1u : 0u;
+        float level = (((capture.frameId >> bit) & 1u) ^ polarity) == 0u ? 0.08 : 0.92;
+        imageStore(generated, pixel, vec4(vec3(level), 1.0));
+        return;
+    }
+    uint index = uint(pixel.y * size.x + pixel.x);
+    float gate = capture.motion != 0u ? texelFetch(alignedImages, pixel, 0).a : 1.0;
+    vec3 color;
+    for (uint c = 0; c < 3; ++c) {
+        uint a = index * 6u + c;
+        uint b = a + 3u;
+        uint d = index * 3u + c;
+        float base = (byteAt(inputTensor.words[a / 4u], a) + byteAt(inputTensor.words[b / 4u], b)) / 510.0;
+        float residual = (byteAt(residualTensor.words[d / 4u], d) - 126.0) * 0.00384376361034811;
+        color[c] = clamp(base + gate * residual, 0.0, 1.0);
+    }
+    imageStore(generated, pixel, vec4(color, 1.0));
+}
+#endif

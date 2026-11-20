@@ -1,0 +1,922 @@
+diff --git a/engine/mako-backend/include/mako-backend/mako.hpp b/engine/mako-backend/include/mako-backend/mako.hpp
+index 5273d13fcbf03eb1ff98460292fb8c973624111c..09c890443be5ab20d738d95c1244dd0976cff29e 100644
+--- a/engine/mako-backend/include/mako-backend/mako.hpp
++++ b/engine/mako-backend/include/mako-backend/mako.hpp
+@@ -239,6 +239,7 @@ namespace mako::backend {
+         /// Check whether the context's separate frame generation program
+         /// stopped, so its submitted work will never finish.
+         [[nodiscard]] bool contextLost(const Context& context) const;
++        [[nodiscard]] bool contextOutputUsable(const Context& context, uint64_t outputValue) const;
+ 
+         /// Replace the separate program behind a lost context. The caller then
+         /// rebuilds its context. False once the restart limit is reached.
+diff --git a/engine/mako-backend/src/context.hpp b/engine/mako-backend/src/context.hpp
+index 19c3d4c5f989499e352debb745f478fbe80e3ad8..2c342ab2df5ec4dfeb8c756d640c7947ad39a807 100644
+--- a/engine/mako-backend/src/context.hpp
++++ b/engine/mako-backend/src/context.hpp
+@@ -19,6 +19,7 @@ class ContextImpl {
+     virtual void setLossHandler(std::function<void()>) {}
+     // Whether this context's separate program stopped, so its work will never finish.
+     [[nodiscard]] virtual bool lost() const { return false; }
++    [[nodiscard]] virtual bool outputUsable(uint64_t) const { return true; }
+     // Which start of that program this context belongs to.
+     [[nodiscard]] virtual uint32_t generation() const { return 0; }
+ };
+diff --git a/engine/mako-backend/src/mako.cpp b/engine/mako-backend/src/mako.cpp
+index 8c06780a9d9238063b3fc340038cd0e1ba6689d6..2a3cf89e22cfd2cb8bbebf567ede6c557f65c9dd 100644
+--- a/engine/mako-backend/src/mako.cpp
++++ b/engine/mako-backend/src/mako.cpp
+@@ -996,6 +996,10 @@ bool Instance::contextLost(const Context& context) const {
+     return context.lost();
+ }
+ 
++bool Instance::contextOutputUsable(const Context& context, uint64_t outputValue) const {
++    return context.outputUsable(outputValue);
++}
++
+ bool Instance::restartFrameGeneration(const Context& context) {
+ #ifdef MAKO_FG
+     if (this->m_fg)
+diff --git a/engine/mako-backend/src/mako_fg.cpp b/engine/mako-backend/src/mako_fg.cpp
+index bbcf4eba9b788efe7a2003ba96680e1b046e6539..fad2772ddeca26c551a7202d3117707568ae40a4 100644
+--- a/engine/mako-backend/src/mako_fg.cpp
++++ b/engine/mako-backend/src/mako_fg.cpp
+@@ -1,13 +1,14 @@
+ /* SPDX-License-Identifier: GPL-3.0-or-later */
+ // MAKO FG runs in mako-fg-host, a separate program installed beside the Renderer. The two share only frames, a
+-// timeline semaphore and the socket messages declared here; the Renderer links no MAKO FG code. Every request waits
+-// for its reply, so generated work reaches the GPU in the order a direct call would give it, and a host failure
++// timeline semaphore and the socket messages declared here; the Renderer links no MAKO FG code. The standard protocol
++// waits for replies so generated work reaches the GPU in order, and a host failure
+ // reaches the Renderer's existing recovery as an exception. Each context has its own socket, so the frame path takes
+ // no lock and a context being built never delays one in use.
+ #include "mako_fg.hpp"
+ #ifdef MAKO_FG
+ #include "mako_fg_protocol.hpp"
+ #include "mako-backend/device_identity.hpp"
++#include "mako-common/configuration/anvil_deadline.hpp"
+ #include "mako-common/helpers/paths.hpp"
+ #include <algorithm>
+ #include <array>
+@@ -33,6 +34,7 @@
+ #include <spawn.h>
+ #include <string_view>
+ #include <sys/socket.h>
++#include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <sys/time.h>
+ #include <sys/wait.h>
+@@ -40,6 +42,12 @@
+ extern char** environ;
+ namespace mako::backend {
+ namespace {
++struct MotionStatus {
++    uint64_t* value{};
++    ~MotionStatus() { if (value) munmap(value, sizeof(*value)); }
++};
++static_assert(std::atomic_ref<uint64_t>::is_always_lock_free);
++
+ using namespace fg_host;
+ constexpr int setupSeconds=120,replySeconds=3;
+ constexpr uint32_t maximumRestarts=3;
+@@ -132,6 +140,28 @@ namespace {
+ bool exchange(int socket,const Request& request,Reply& reply) {
+     return send(socket,&request,sizeof request,MSG_NOSIGNAL)==ssize_t(sizeof request)&&receive(socket,reply);
+ }
++
++bool exchangeAnvilSchedule(int socket, const Request& request, Reply& reply) {
++    using namespace std::chrono;
++    const auto deadline = steady_clock::now() + anvilScheduleReplyBudget;
++    if (send(socket, &request, sizeof request, MSG_DONTWAIT | MSG_NOSIGNAL) != ssize_t(sizeof request))
++        return false;
++    pollfd item{socket, POLLIN, 0};
++    do {
++        const auto remaining = deadline - steady_clock::now();
++        if (remaining <= steady_clock::duration::zero())
++            return false;
++        const auto seconds = duration_cast<std::chrono::seconds>(remaining);
++        const auto nanos = duration_cast<nanoseconds>(remaining - seconds);
++        const timespec limit{seconds.count(), nanos.count()};
++        const int result = ppoll(&item, 1, &limit, nullptr);
++        if (result > 0)
++            return (item.revents & POLLIN) &&
++                recv(socket, &reply, sizeof reply, MSG_DONTWAIT) >= replyHeader;
++        if (result == 0 || errno != EINTR)
++            return false;
++    } while (true);
++}
+ void requireReply(int socket,const Request& request,Reply& reply) {
+     if(!exchange(socket,request,reply))throw error("MAKO FG host stopped responding");
+     if(reply.failed)throw error(reply.text);
+@@ -144,12 +174,28 @@ class FGContext final : public ContextImpl {
+         std::array<int,2> sockets{-1,-1};
+         if(socketpair(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0,sockets.data())!=0)throw error("Unable to create a MAKO FG context socket");
+         socket=sockets[0];
+-        std::vector<int> descriptors;descriptors.reserve(capacity+4);descriptors.push_back(sockets[1]);
++        std::vector<int> descriptors;descriptors.reserve(capacity+5);descriptors.push_back(sockets[1]);
+         descriptors.push_back(source.take());descriptors.push_back(source.take());descriptors.push_back(sync.take());
+         for(size_t i=0;i<capacity;i++)descriptors.push_back(dest.take());
+         struct Sent {std::vector<int>& list;~Sent(){for(int descriptor:list)close(descriptor);}} sent{descriptors};
++        if (anvilMotionEnabled()) {
++            const int fd = memfd_create("anvil-motion-status", MFD_CLOEXEC);
++            if (fd >= 0)
++                descriptors.push_back(fd);
++            if (fd < 0 || ftruncate(fd, sizeof(uint64_t)) != 0) {
++                close(socket);
++                throw error("Unable to allocate ANVIL motion status");
++            }
++            void* mapping = mmap(nullptr, sizeof(uint64_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++            if (mapping == MAP_FAILED) {
++                close(socket);
++                throw error("Unable to map ANVIL motion status");
++            }
++            status.value = static_cast<uint64_t*>(mapping);
++            *status.value = 0;
++        }
+         open.op=Open;open.count=uint32_t(capacity);
+-        alignas(cmsghdr) std::array<char,CMSG_SPACE(sizeof(int)*(maxOutputs+4))> space{};iovec part{&open,sizeof open};
++        alignas(cmsghdr) std::array<char,CMSG_SPACE(sizeof(int)*(maxOutputs+5))> space{};iovec part{&open,sizeof open};
+         msghdr message{};message.msg_iov=&part;message.msg_iovlen=1;message.msg_control=space.data();message.msg_controllen=CMSG_SPACE(sizeof(int)*descriptors.size());
+         auto* item=CMSG_FIRSTHDR(&message);item->cmsg_level=SOL_SOCKET;item->cmsg_type=SCM_RIGHTS;item->cmsg_len=CMSG_LEN(sizeof(int)*descriptors.size());
+         std::memcpy(CMSG_DATA(item),descriptors.data(),sizeof(int)*descriptors.size());
+@@ -179,21 +225,24 @@ class FGContext final : public ContextImpl {
+     FGContext& operator=(const FGContext&)=delete;
+     void setLossHandler(std::function<void()> handler) override {link->setRelease(std::move(handler));}
+     bool lost() const override {return link->lost.load(std::memory_order_relaxed);}
++    bool outputUsable(uint64_t outputValue) const override {
++        return !status.value || std::atomic_ref(*status.value).load(std::memory_order_acquire) == ((outputValue << 1) | 1u);
++    }
+     uint32_t generation() const override {return hostGeneration;}
+     uint32_t width() const {return analysisWidth;}
+     uint32_t height() const {return analysisHeight;}
+     void scheduleFrames() override {
+         Request request{};request.op=Schedule;request.count=uint32_t(capacity);
+         for(size_t i=0;i<capacity;i++)request.times[i]=float(i+1)/float(capacity+1);
+-        call(request);
++        schedule(request);
+     }
+     void scheduleFrames(std::span<const float> times,std::chrono::nanoseconds interval) override {
+         if(times.size()>maxOutputs)throw error("Too many MAKO FG output timestamps");
+         Request request{};request.op=Schedule;request.count=uint32_t(times.size());request.interval=seconds(interval);
+-        std::copy(times.begin(),times.end(),request.times);call(request);
++        std::copy(times.begin(),times.end(),request.times);schedule(request);
+     }
+     void scheduleFrameHistory(std::chrono::nanoseconds interval) override {
+-        Request request{};request.op=Schedule;request.interval=seconds(interval);call(request);
++        Request request{};request.op=Schedule;request.interval=seconds(interval);schedule(request);
+     }
+     bool waitForIdle(uint64_t ns) const override {
+         // A lost host has no work left, and every gate that waits for idle must be able to continue.
+@@ -214,11 +263,26 @@ class FGContext final : public ContextImpl {
+         result.timestampPeriodNs=p.period;result.timestampValidBits=p.validBits;return result;
+     }
+ private:
++    void schedule(Request request) const {
++        if (!anvilAsyncScheduleEnabled()) {
++            call(request);
++            return;
++        }
++        if (lost())
++            throw error("ANVIL worker stopped responding");
++        request.op = ScheduleAsync;
++        if (send(socket, &request, sizeof request, MSG_DONTWAIT | MSG_NOSIGNAL) != ssize_t(sizeof request)) {
++            link->lose();
++            throw error("Unable to queue the ANVIL frame");
++        }
++    }
+     void call(const Request& request) const {Reply reply;call(request,reply);}
+     // After a lost reply a late answer would pair with the wrong request, so this context stays failed.
+     void call(const Request& request,Reply& reply) const {
+         if(lost())throw error("MAKO FG host stopped responding");
+-        if(!exchange(socket,request,reply)){link->lose();throw error("MAKO FG host stopped responding");}
++        const bool received = request.op == Schedule && anvilDeadlineEnabled()
++            ? exchangeAnvilSchedule(socket, request, reply) : exchange(socket, request, reply);
++        if(!received){link->lose();throw error("MAKO FG host stopped responding");}
+         if(reply.failed)throw error(reply.text);
+     }
+     size_t capacity;
+@@ -226,6 +290,7 @@ class FGContext final : public ContextImpl {
+     int socket{-1};
+     uint32_t analysisWidth{},analysisHeight{};
+     std::shared_ptr<HostLink> link;
++    MotionStatus status;
+ };
+ // Every MAKO exchange encoding, numbered as the host expects.
+ int32_t fgEncoding(FrameEncoding encoding) {
+@@ -347,7 +412,9 @@ void MakoFG::connect() {
+     try {
+         limitReplies(host,setupSeconds);
+         Request request{};request.op=Hello;Reply reply;requireReply(host,request,reply);
+-        if(reply.first!=hostProtocol||reply.second!=sizeof(Request))throw error("MAKO FG host does not match this Renderer");
++        const auto expected = anvilMotionEnabled() ? anvilMotionProtocol :
++            anvilAsyncScheduleEnabled() ? anvilAsyncProtocol : hostProtocol;
++        if(reply.first!=expected||reply.second!=sizeof(Request))throw error("MAKO FG host does not match this Renderer");
+         label=reply.text;
+     } catch(...) {close(host);throw;}
+     control=host;hostGeneration++;
+diff --git a/engine/mako-backend/src/mako_fg_protocol.hpp b/engine/mako-backend/src/mako_fg_protocol.hpp
+index c85f06992788ec1690b9511adcadba9dfc6cdf6b..d9765b4f777da5ce529efff6156697524b61867a 100644
+--- a/engine/mako-backend/src/mako_fg_protocol.hpp
++++ b/engine/mako-backend/src/mako_fg_protocol.hpp
+@@ -7,9 +7,14 @@
+ #include <cstdint>
+ namespace mako::backend::fg_host {
+ constexpr uint32_t hostProtocol=3;
++// Local Odin protocol variant. ScheduleAsync has no corresponding reply.
++constexpr uint32_t anvilAsyncProtocol=0x414E0001;
++// The motion variant passes a final memfd in Open, holding one uint64_t.
++// Worker publishes (output timeline value << 1) | accepted before signaling the timeline.
++constexpr uint32_t anvilMotionProtocol=0x414E0002;
+ constexpr size_t maxOutputs=32;
+ constexpr int hostDescriptor=3;
+-enum Op:uint32_t {Hello=1,Devices,Supports,Open,Schedule,Ready,EnableProfiling,ReadProfile};
++enum Op:uint32_t {Hello=1,Devices,Supports,Open,Schedule,Ready,EnableProfiling,ReadProfile,ScheduleAsync};
+ // Schedule's `interval` is the time in seconds between the batch's two real frames, 0 when unknown.
+ struct alignas(8) Request {
+     uint32_t op,count;uint64_t timeout;int32_t device,encoding,period;uint32_t half,width,height;
+diff --git a/engine/mako-render/src/gamescope_scaling_surface.cpp b/engine/mako-render/src/gamescope_scaling_surface.cpp
+index 39c5faf22548ba83352fcc0749c0f596d595c971..3187cced0e0518150faa7db0ebd9f9b3af0c5b8b 100644
+--- a/engine/mako-render/src/gamescope_scaling_surface.cpp
++++ b/engine/mako-render/src/gamescope_scaling_surface.cpp
+@@ -1488,6 +1488,14 @@ VkResult GamescopeScalingSurface::preparePresent(
+             const auto now = nanos(submittedAt);
+             auto& diagnostics = *content->second->timing;
+             diagnostics.request(content->second->presentId, ns, now, nanos(slot->submitAt));
++            if (sourceFrameSerial && present_diagnostics::bridgeFramesEnabled()) {
++                std::ostringstream line;
++                line << "MAKO Renderer: present diagnostics: operation=gamescope-bridge-request"
++                     << " bridge=" << state.diagnosticId << " id=" << state.presentId
++                     << " source_frame=" << *sourceFrameSerial
++                     << " batch=" << outputBatchSize << " desired_ns=" << ns << '\n';
++                std::cerr << line.str();
++            }
+             if (const auto window = diagnostics.take(now))
+                 present_diagnostics::logBridgeTiming(content->second->diagnosticId,
+                     swapchain, *window, diagnostics.outstanding(), state.refreshCycleNs,
+diff --git a/engine/mako-render/src/swapchain/create.cpp b/engine/mako-render/src/swapchain/create.cpp
+index 84980f7f35944394da31136830785c806d292ebc..d2dc628bd9917952f47043c3c624f995147f2187 100644
+--- a/engine/mako-render/src/swapchain/create.cpp
++++ b/engine/mako-render/src/swapchain/create.cpp
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: GPL-3.0-or-later */
+ 
+ #include "swapchain/swapchain.hpp"
++#include "mako-common/configuration/anvil_deadline.hpp"
+ #include "swapchain/create_policy.hpp"
+ #include "swapchain/retirement.hpp"
+ #include "layer_role.hpp"
+@@ -409,7 +410,8 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance* backend,
+         ls::FileDescriptorScope sourceScope{sourceFds};
+         std::vector<int> destinationFds(generatedFrameCapacityForProfile(this->profile), -1);
+         ls::FileDescriptorScope destinationScope{destinationFds};
+-        const auto sourceImageUsage = frameGenerationSourceImageUsage(
++        const auto sourceImageUsage = anvilDeadlineEnabled() ? anvilSourceImageUsage :
++            frameGenerationSourceImageUsage(
+             this->spatialFramePipelinePlacement,
+             directSpatialFrameGenerationOutputSupported(
+                 vk, this->colorPipeline.exchangeFormat,
+@@ -429,12 +431,15 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance* backend,
+         for (int& fd : destinationFds)
+             this->destinationImages.emplace_back(vk,
+                 generationExtent, this->colorPipeline.exchangeFormat,
+-                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++                anvilDeadlineEnabled() ? anvilOutputImageUsage :
++                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                 std::nullopt, &fd);
+ 
+         int syncFd{-1};
+         ls::FileDescriptorScope syncScope{{&syncFd, 1}};
+         this->syncSemaphore.emplace(vk, 0, std::nullopt, &syncFd);
++        if (anvilRenderBoundaryEnabled())
++            this->anvilRenderBoundary.emplace(vk, 0);
+ 
+         const auto contextSettings = frameGenerationContextSettings(this->profile);
+         try {
+@@ -452,9 +457,11 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance* backend,
+                     backend->closeContext(ctx);
+                 }
+             );
+-            backend->setContextLossHandler(
+-                this->ctx.get(), this->syncSemaphore->releaser(vk)
+-            );
++            if (!anvilDeadlineEnabled()) {
++                backend->setContextLossHandler(
++                    this->ctx.get(), this->syncSemaphore->releaser(vk)
++                );
++            }
+ 
+             // The backend's private VkDevice must outlive this layer on loader
+             // combinations where destroying it during layer unload is unsafe.
+diff --git a/engine/mako-render/src/swapchain/present.cpp b/engine/mako-render/src/swapchain/present.cpp
+index 0bc933a86beca8e449f214f3e043ff0e1252caf2..4bd0c3455ce2ce1ad10ac04c0ee6149e757f19c4 100644
+--- a/engine/mako-render/src/swapchain/present.cpp
++++ b/engine/mako-render/src/swapchain/present.cpp
+@@ -5,6 +5,7 @@
+ #include "swapchain/present/internal.hpp"
+ #include "swapchain/retirement.hpp"
+ #include "adaptive_scheduler.hpp"
++#include "mako-common/configuration/anvil_deadline.hpp"
+ #include "mako-common/helpers/errors.hpp"
+ #include "mako-common/vulkan/command_buffer.hpp"
+ #include "mako-common/vulkan/image.hpp"
+@@ -574,6 +575,8 @@ VkResult Swapchain::presentFrame(const vk::Vulkan& vk,
+     // reconstruction and the real frame, and retain all GPU ownership guards.
+     if (this->steamMenuSuspended)
+         return this->presentNativeFrame(invocation);
++    if (anvilDeadlineEnabled())
++        return this->presentWithAnvilDeadline(invocation);
+     const auto replacementStabilization =
+         this->recoveryState.replacementBackendStabilization.beforeFrame(
+             presentNow
+@@ -926,3 +929,172 @@ VkResult Swapchain::presentFrame(const vk::Vulkan& vk,
+         invocation, plan, gamescopeHdrTransport
+     );
+ }
++
++VkResult Swapchain::presentWithAnvilDeadline(const PresentInvocation& invocation) {
++    if (!this->instance || !this->instance->usesSeparateProgram() ||
++            this->sourceImages.size() != 2 || this->destinationImages.empty() ||
++            !this->syncSemaphore.has_value() || !this->renderFence.has_value() ||
++            this->spatialScaler || this->profile.adaptive ||
++            this->profile.multiplier != 2 ||
++            (this->colorPipeline.encoding != backend::FrameEncoding::Sdr8 &&
++             this->colorPipeline.encoding != backend::FrameEncoding::SdrHighPrecision)) {
++        return this->presentNativeFrame(invocation);
++    }
++
++    auto& recovery = this->recoveryState;
++    if (this->instance->contextLost(this->ctx.get())) {
++        if (!recovery.anvilWorkerStopped) {
++            std::clog << "MAKO Renderer: anvil-deadline action=worker-lost"
++                      << " frame=" << this->frameState.realFrameIndex << '\n';
++        }
++        recovery.anvilWorkerStopped = true;
++    }
++    if (recovery.anvilWorkerStopped)
++        return this->presentNativeFrame(invocation);
++
++    const auto& vk = invocation.vk;
++    if (recovery.anvilOutputPending != 0) {
++        if (!this->syncSemaphore->wait(vk, recovery.anvilOutputPending, 0)) {
++            if (presentDiagnosticsEnabled()) {
++                std::clog << "MAKO Renderer: anvil-deadline action=worker-pending"
++                          << " frame=" << this->frameState.realFrameIndex << '\n';
++            }
++            return this->presentNativeFrame(invocation);
++        }
++        recovery.anvilOutputPending = 0;
++    }
++    if (!this->prepareRenderFence(vk, true))
++        return this->presentNativeFrame(invocation);
++
++    auto plan = this->prepareFramePlan(invocation.cadenceStarted, false, std::nullopt);
++    const bool generate = this->frameState.backendFrameIndex > 0 &&
++        !plan.historyWarmupActive && !plan.requestedGeneratedFrames.empty();
++    const auto started = DiagnosticsClock::now();
++    const auto interval = this->frameState.backendSourceInterval(invocation.cadenceStarted);
++    try {
++        if (generate) {
++            plan.scheduledGeneratedFrames = scheduleAdmittedGeneratedFrames(
++                plan.requestedGeneratedFrames, 1);
++            this->instance->scheduleFrames(
++                this->ctx.get(), plan.scheduledGeneratedFrames.timestamps(), interval);
++        } else {
++            this->instance->scheduleFrameHistory(this->ctx.get(), interval);
++        }
++    } catch (const std::exception& error) {
++        recovery.anvilWorkerStopped = true;
++        std::clog << "MAKO Renderer: anvil-deadline action=schedule-failed"
++                  << " frame=" << this->frameState.realFrameIndex
++                  << " error=" << error.what() << '\n';
++        return this->presentNativeFrame(invocation);
++    }
++
++    const auto& source = this->sourceImages.at(this->frameState.backendFrameIndex % 2);
++    const auto sourceValue = this->frameState.backendTimelineIndex;
++    this->submitSourceCopy(invocation, this->info.images.at(invocation.imageIndex), source,
++        recovery.anvilSourceReuseValue);
++    if (!generate)
++        return this->presentHistoryOnly(invocation, plan, sourceValue);
++
++    const auto outputValue = this->frameState.backendTimelineIndex;
++    recovery.anvilSourceReuseValue = outputValue;
++    const bool sourceRelative = anvilReadyWindowEnabled();
++    static const bool testExtendedWindow = [] {
++        const char* value = std::getenv("MAKO_ANVIL_TAIL_WINDOW");
++        return value && std::string_view(value) == "1";
++    }();
++    static const bool coverageWindow = [] {
++        const char* value = std::getenv("MAKO_ANVIL_COVERAGE_WINDOW");
++        return anvilMotionEnabled() && value && std::string_view(value) == "1";
++    }();
++    const auto ceiling = anvilMotionEnabled() ? std::chrono::milliseconds(coverageWindow ? 35 : 23) :
++        testExtendedWindow ? std::chrono::milliseconds(20) : anvilReadyWindowCeiling;
++    const auto workerBudget = anvilMotionEnabled()
++        ? std::chrono::milliseconds(coverageWindow ? 16 : 10) : anvilPresentBudget;
++    const auto hardDeadline = started + (sourceRelative ? ceiling : anvilPresentBudget);
++    auto deadline = hardDeadline;
++    const auto submitted = DiagnosticsClock::now();
++    const bool trace = presentDiagnosticsEnabled();
++    std::optional<DiagnosticsClock::time_point> renderReady;
++    std::optional<DiagnosticsClock::time_point> sourceReady;
++    std::optional<DiagnosticsClock::time_point> outputReady;
++    bool ready = false;
++    // A finite Vulkan wait rounds to driver granularity. Poll against the
++    // wall clock to reject a completion observed after the actual deadline.
++    for (auto now = DiagnosticsClock::now(); now < deadline; now = DiagnosticsClock::now()) {
++        if (trace && this->anvilRenderBoundary.has_value() && !renderReady &&
++                this->anvilRenderBoundary->wait(vk, sourceValue, 0))
++            renderReady = DiagnosticsClock::now();
++        if ((trace || sourceRelative) && !sourceReady &&
++                this->syncSemaphore->wait(vk, sourceValue, 0)) {
++            sourceReady = DiagnosticsClock::now();
++            if (sourceRelative)
++                deadline = std::min(hardDeadline, *sourceReady + workerBudget);
++        }
++        if (this->syncSemaphore->wait(vk, outputValue, 0)) {
++            outputReady = DiagnosticsClock::now();
++            ready = *outputReady < deadline;
++            break;
++        }
++        if (this->instance->contextLost(this->ctx.get()))
++            break;
++        std::this_thread::sleep_until(std::min(
++            deadline, now + std::chrono::microseconds(250)));
++    }
++    const bool usable = ready && this->instance->contextOutputUsable(this->ctx.get(), outputValue);
++    const auto acquireStart = DiagnosticsClock::now();
++    if (usable)
++        this->preacquireGeneratedImages(invocation, plan, false, false, 0);
++    const auto acquisition = DiagnosticsClock::now() - acquireStart;
++    if (trace) {
++        const auto micros = [&](const auto time) {
++            return std::chrono::duration_cast<std::chrono::microseconds>(time - started).count();
++        };
++        std::ostringstream out;
++        out << "MAKO Renderer: anvil-timing context=" << this->diagnosticsState.contextId
++            << " frame=" << this->frameState.realFrameIndex
++            << " source_value=" << sourceValue
++            << " started_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(
++                started.time_since_epoch()).count()
++            << " source_submit_us=" << micros(submitted)
++            << " source_ready_us=" << (sourceReady ? micros(*sourceReady) : -1)
++            << " output_ready_us=" << (outputReady ? micros(*outputReady) : -1)
++            << " admitted=" << (usable && plan.admittedGeneratedFrameCount == 1)
++            << " render_ready_us=" << (renderReady ? micros(*renderReady) : -1)
++            << " same_queue=" << (vk.queue() == invocation.queue)
++            << " deadline_us=" << micros(deadline)
++            << " worker_on_time=" << ready
++            << " worker_rejected=" << (ready && !usable)
++            << " acquire_us=" << std::chrono::duration_cast<std::chrono::microseconds>(acquisition).count()
++            << '\n';
++        std::clog << out.str();
++    }
++    if (usable && plan.admittedGeneratedFrameCount == 1) {
++        if (presentDiagnosticsEnabled()) {
++            std::clog << "MAKO Renderer: anvil-deadline action=completed"
++                      << " frame=" << this->frameState.realFrameIndex
++                      << " output=" << outputValue << '\n';
++        }
++        this->frameState.backendFrameIndex++;
++        this->frameState.backendSourceCadence = invocation.cadenceStarted;
++        // The existing Gamescope output clock must see the generated image
++        // and its original as a single two-output source batch.
++        this->bridgeOutputBatchSize = plan.admittedGeneratedFrameCount + 1;
++        return this->presentGeneratedFrames(invocation, plan, false);
++    }
++
++    // Only the renderer's own source-copy timeline enters the fallback queue.
++    // Keep the missing output's value reserved until it is actually complete.
++    if (!ready)
++        recovery.anvilOutputPending = outputValue;
++    this->frameState.backendTimelineIndex++;
++    this->diagnosticsState.fixedSkippedFrames++;
++    if (presentDiagnosticsEnabled()) {
++        std::clog << "MAKO Renderer: anvil-deadline action=real-only"
++                  << " frame=" << this->frameState.realFrameIndex
++                  << " reason=" << (!ready ? "worker-deadline" : !usable ? "motion-rejected" : "wsi-busy")
++                  << " output=" << outputValue << " elapsed_us="
++                  << std::chrono::duration_cast<std::chrono::microseconds>(
++                       DiagnosticsClock::now() - started).count() << '\n';
++    }
++    return this->presentHistoryOnly(invocation, plan, sourceValue);
++}
+diff --git a/engine/mako-render/src/swapchain/present/admission.cpp b/engine/mako-render/src/swapchain/present/admission.cpp
+index c53f7fc8698db349ed4aa798b67a69961a7c3dbc..445c9ba2340635b11818347c554a851f2aeb1a11 100644
+--- a/engine/mako-render/src/swapchain/present/admission.cpp
++++ b/engine/mako-render/src/swapchain/present/admission.cpp
+@@ -309,10 +309,10 @@ bool Swapchain::generationPipelineReady(const vk::Vulkan& vk,
+     return true;
+ }
+ 
+-bool Swapchain::prepareRenderFence(const vk::Vulkan& vk) {
++bool Swapchain::prepareRenderFence(const vk::Vulkan& vk, const bool poll) {
+     if (this->frameState.renderFenceInFlight) {
+         const bool fenceSignaled = this->renderFence->wait(
+-            vk, renderFenceWaitBudgetNs
++            vk, poll ? 0 : renderFenceWaitBudgetNs
+         );
+         if (!fenceSignaled)
+             return false;
+diff --git a/engine/mako-render/src/swapchain/present/generated_frames.cpp b/engine/mako-render/src/swapchain/present/generated_frames.cpp
+index 9ccbe225505419cfe9ceacaec00e6ab83da6faa3..6915c74cc2e0becdd9d2a91fe93a9412bdf6604b 100644
+--- a/engine/mako-render/src/swapchain/present/generated_frames.cpp
++++ b/engine/mako-render/src/swapchain/present/generated_frames.cpp
+@@ -4,6 +4,7 @@
+ #include "swapchain/present/internal.hpp"
+ #include "swapchain/retirement.hpp"
+ #include "adaptive_scheduler.hpp"
++#include "mako-common/configuration/anvil_deadline.hpp"
+ #include "mako-common/helpers/errors.hpp"
+ #include "mako-common/vulkan/command_buffer.hpp"
+ #include "mako-common/vulkan/image.hpp"
+@@ -53,6 +54,15 @@ VkResult Swapchain::presentGeneratedFrames(
+     auto generatedSubmitDuration = DiagnosticsClock::duration::zero();
+     auto generatedPresentDuration = DiagnosticsClock::duration::zero();
+     auto originalPresentDuration = DiagnosticsClock::duration::zero();
++    static const bool testPairPacing = [] {
++        const char* value = std::getenv("MAKO_ANVIL_PAIR_PACING");
++        return anvilDeadlineEnabled() && value && std::string_view(value) == "1";
++    }();
++    static const bool testShortPairGap = [] {
++        const char* value = std::getenv("MAKO_ANVIL_SHORT_PAIR_GAP");
++        return value && std::string_view(value) == "1";
++    }();
++    DiagnosticsClock::time_point lastGeneratedPresent{};
+     bool acquireDeadlineExceeded = false;
+     uint64_t lastAcquireTimeout = 0;
+     const auto reportOrderedAcquire = [&](const bool timedOut,
+@@ -407,6 +417,11 @@ VkResult Swapchain::presentGeneratedFrames(
+                 destinationImage.getExtent(),
+                 postBarriers
+             );
++            if (anvilDeadlineEnabled()) {
++                vk::releaseExternalImage(invocation.vk, commandBuffer.handle(),
++                    destinationImage.handle(), VK_ACCESS_TRANSFER_READ_BIT,
++                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++            }
+         }
+ 
+         std::array<VkSemaphore, 2> waitSemaphores{
+@@ -516,6 +531,8 @@ VkResult Swapchain::presentGeneratedFrames(
+             throw ls::vulkan_error(result, "vkQueuePresentKHR() failed");
+         if (!this->adaptiveScheduler)
+             this->diagnosticsState.fixedGeneratedFrames++;
++        if (testPairPacing)
++            lastGeneratedPresent = DiagnosticsClock::now();
+ 
+         this->frameState.sequenceIndex++;
+         this->frameState.backendTimelineIndex++;
+@@ -524,6 +541,20 @@ VkResult Swapchain::presentGeneratedFrames(
+     auto& lastPostCopy = this->postCopySemaphores.at(
+         (this->frameState.sequenceIndex - 1) % this->postCopySemaphores.size()
+     );
++    if (testPairPacing && lastGeneratedPresent != DiagnosticsClock::time_point{} &&
++            this->gamescopeRefreshHz.value_or(0) >= 60) {
++        const auto interval = std::chrono::duration_cast<DiagnosticsClock::duration>(
++            std::chrono::duration<double>((testShortPairGap ? 0.5 : 1.0) / *this->gamescopeRefreshHz));
++        invocation.waitForOutput(lastGeneratedPresent + interval);
++        if (presentDiagnosticsEnabled()) {
++            const auto separation = DiagnosticsClock::now() - lastGeneratedPresent;
++            std::clog << "MAKO Renderer: anvil-pair context=" << this->diagnosticsState.contextId
++                      << " frame=" << this->frameState.realFrameIndex
++                      << " pre_real_wait_us="
++                      << std::chrono::duration_cast<std::chrono::microseconds>(separation).count()
++                      << '\n';
++        }
++    }
+     const auto result = this->presentOriginalImage(
+         invocation, lastPostCopy.second.handle(),
+         this->gamescopeDetected ? invocation.nextChain : nullptr,
+diff --git a/engine/mako-render/src/swapchain/present/real_frames.cpp b/engine/mako-render/src/swapchain/present/real_frames.cpp
+index 2bae9b11e625e0883b843672e7adac0f022a79c2..e9760d1c0cd33963fdd1fd3c48997d4cf6a1b8d1 100644
+--- a/engine/mako-render/src/swapchain/present/real_frames.cpp
++++ b/engine/mako-render/src/swapchain/present/real_frames.cpp
+@@ -4,6 +4,7 @@
+ #include "swapchain/present/internal.hpp"
+ #include "swapchain/retirement.hpp"
+ #include "adaptive_scheduler.hpp"
++#include "mako-common/configuration/anvil_deadline.hpp"
+ #include "mako-common/helpers/errors.hpp"
+ #include "mako-common/vulkan/command_buffer.hpp"
+ #include "mako-common/vulkan/image.hpp"
+@@ -267,7 +268,8 @@ VkResult Swapchain::presentOriginalImage(
+ }
+ 
+ void Swapchain::submitSourceCopy(const PresentInvocation& invocation,
+-        const VkImage swapchainImage, const vk::Image& sourceImage) {
++        const VkImage swapchainImage, const vk::Image& sourceImage,
++        const uint64_t previousWorkerValue) {
+     if (this->spatialScaler &&
+             this->spatialFramePipelinePlacement ==
+                 SpatialFramePipelinePlacement::PreFrameGeneration) {
+@@ -297,6 +299,8 @@ void Swapchain::submitSourceCopy(const PresentInvocation& invocation,
+     }
+ 
+     const auto& commandBuffer = *this->renderCommandBuffer;
++    const bool reclaimSource = anvilDeadlineEnabled() &&
++        this->frameState.backendFrameIndex >= this->sourceImages.size();
+     const std::array preBarriers{
+         barrierHelper(swapchainImage,
+             VK_ACCESS_NONE,
+@@ -307,7 +311,7 @@ void Swapchain::submitSourceCopy(const PresentInvocation& invocation,
+         barrierHelper(sourceImage.handle(),
+             VK_ACCESS_NONE,
+             VK_ACCESS_TRANSFER_WRITE_BIT,
+-            VK_IMAGE_LAYOUT_UNDEFINED,
++            reclaimSource ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+         ),
+     };
+@@ -322,6 +326,10 @@ void Swapchain::submitSourceCopy(const PresentInvocation& invocation,
+         ),
+     };
+     commandBuffer.begin(invocation.vk);
++    if (reclaimSource) {
++        vk::acquireExternalImage(invocation.vk, commandBuffer.handle(),
++            sourceImage.handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
++    }
+     commandBuffer.blitImage(invocation.vk,
+         preBarriers,
+         {swapchainImage, sourceImage.handle()},
+@@ -334,10 +342,41 @@ void Swapchain::submitSourceCopy(const PresentInvocation& invocation,
+     const auto sourceTimelineValue =
+         this->frameState.backendTimelineIndex++;
+     this->frameState.sequenceIndex++;
+-    commandBuffer.submit(invocation.vk,
+-        invocation.waitSemaphores, VK_NULL_HANDLE, 0,
+-        {}, this->syncSemaphore->handle(), sourceTimelineValue
+-    );
++    const auto shared = this->syncSemaphore->handle();
++    if (this->anvilRenderBoundary.has_value()) {
++        const auto boundary = this->anvilRenderBoundary->handle();
++        std::vector<VkSemaphore> waits(invocation.waitSemaphores.begin(),
++                                      invocation.waitSemaphores.end());
++        std::vector<uint64_t> waitValues(waits.size(), 0);
++        if (previousWorkerValue) {
++            waits.push_back(shared);
++            waitValues.push_back(previousWorkerValue);
++        }
++        const uint32_t count = static_cast<uint32_t>(waits.size());
++        const std::vector<VkPipelineStageFlags> stages(count, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
++        const VkTimelineSemaphoreSubmitInfo values{
++            .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
++            .waitSemaphoreValueCount = count, .pWaitSemaphoreValues = waitValues.data(),
++            .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &sourceTimelineValue,
++        };
++        const VkSubmitInfo wait{
++            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &values,
++            .waitSemaphoreCount = count, .pWaitSemaphores = waits.data(),
++            .pWaitDstStageMask = stages.data(),
++            .signalSemaphoreCount = 1, .pSignalSemaphores = &boundary,
++        };
++        const auto result = invocation.vk.df().QueueSubmit(
++            invocation.vk.queue(), 1, &wait, VK_NULL_HANDLE);
++        if (result != VK_SUCCESS)
++            throw ls::vulkan_error(result, "ANVIL render boundary submission failed");
++        commandBuffer.submit(invocation.vk, {}, boundary, sourceTimelineValue,
++            {}, shared, sourceTimelineValue);
++    } else {
++        // Reacquiring a slot needs a GPU wait even after a host readiness check.
++        commandBuffer.submit(invocation.vk,
++            invocation.waitSemaphores, previousWorkerValue ? shared : VK_NULL_HANDLE,
++            previousWorkerValue, {}, shared, sourceTimelineValue);
++    }
+     logSlowPresentOperation(
+         "submit-source-copy", this->frameState.realFrameIndex,
+         this->frameState.sequenceIndex, sourceSubmitStarted
+@@ -346,13 +385,14 @@ void Swapchain::submitSourceCopy(const PresentInvocation& invocation,
+ 
+ VkResult Swapchain::presentHistoryOnly(
+         const PresentInvocation& invocation,
+-        const PresentationFramePlan& plan) {
++        const PresentationFramePlan& plan,
++        const std::optional<uint64_t> scheduledSourceValue) {
+     PresentPhaseDurations phases{
+         .renderFence = plan.renderFenceWaitDuration,
+         .sourceCopy = plan.submitSourceCopyDuration,
+     };
+-    const uint64_t sourceTimelineValue =
+-        this->frameState.backendTimelineIndex - 1;
++    const uint64_t sourceTimelineValue = scheduledSourceValue.value_or(
++        this->frameState.backendTimelineIndex - 1);
+     auto& fallbackPass = this->passes.front();
+     auto& fallbackSemaphores = this->postCopySemaphores.at(
+         this->frameState.sequenceIndex % this->postCopySemaphores.size()
+@@ -375,10 +415,12 @@ VkResult Swapchain::presentHistoryOnly(
+ 
+     const auto historyScheduleStarted = startPresentDiagnostic();
+     try {
+-        this->instance->scheduleFrameHistory(
+-            this->ctx.get(),
+-            this->frameState.backendSourceInterval(invocation.cadenceStarted)
+-        );
++        if (!scheduledSourceValue) {
++            this->instance->scheduleFrameHistory(
++                this->ctx.get(),
++                this->frameState.backendSourceInterval(invocation.cadenceStarted)
++            );
++        }
+     } catch (const std::exception& error) {
+         phases.schedule = finishPresentDiagnostic(historyScheduleStarted);
+         // The fallback copy is already queued and signals fallbackSemaphore.
+diff --git a/engine/mako-render/src/swapchain/resources.cpp b/engine/mako-render/src/swapchain/resources.cpp
+index 16867eff7559a1e975e7a3d610420be65bd36c2e..3871c83779e1832c1db91777ea0a434ce26b6ee8 100644
+--- a/engine/mako-render/src/swapchain/resources.cpp
++++ b/engine/mako-render/src/swapchain/resources.cpp
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: GPL-3.0-or-later */
+ 
+ #include "swapchain/swapchain.hpp"
++#include "mako-common/configuration/anvil_deadline.hpp"
+ #include "present_diagnostics.hpp"
+ #include "mako-common/helpers/errors.hpp"
+ #include "mako-common/helpers/file_descriptors.hpp"
+@@ -186,7 +187,8 @@ Swapchain::buildFrameGenerationResources(const vk::Vulkan& vk,
+     resources.hdrReducedPrecision = ls::hdrApproximateGeneration(resourceProfile.hdr_quality);
+     resources.sourceImages.reserve(sourceFds.size());
+     resources.destinationImages.reserve(destinationFds.size());
+-    const auto sourceImageUsage = frameGenerationSourceImageUsage(
++    const auto sourceImageUsage = anvilDeadlineEnabled() ? anvilSourceImageUsage :
++        frameGenerationSourceImageUsage(
+         this->spatialFramePipelinePlacement,
+         directSpatialFrameGenerationOutputSupported(
+             vk, pipeline.exchangeFormat,
+@@ -203,13 +205,16 @@ Swapchain::buildFrameGenerationResources(const vk::Vulkan& vk,
+     for (int& fd : destinationFds) {
+         resources.destinationImages.emplace_back(vk,
+             extent, pipeline.exchangeFormat,
+-            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++            anvilDeadlineEnabled() ? anvilOutputImageUsage :
++                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+             std::nullopt, &fd);
+     }
+ 
+     int syncFd{-1};
+     ls::FileDescriptorScope syncScope{{&syncFd, 1}};
+     resources.syncSemaphore.emplace(vk, 0, std::nullopt, &syncFd);
++    if (anvilRenderBoundaryEnabled())
++        resources.anvilRenderBoundary.emplace(vk, 0);
+     const auto contextSettings = frameGenerationContextSettings(resourceProfile);
+     resources.context = ls::owned_ptr<ls::R<backend::Context>>(
+         new ls::R<backend::Context>(backendInstance.openContext(
+@@ -224,9 +229,11 @@ Swapchain::buildFrameGenerationResources(const vk::Vulkan& vk,
+             backend->closeContext(context);
+         }
+     );
+-    backendInstance.setContextLossHandler(
+-        resources.context.get(), resources.syncSemaphore->releaser(vk)
+-    );
++    if (!anvilDeadlineEnabled()) {
++        backendInstance.setContextLossHandler(
++            resources.context.get(), resources.syncSemaphore->releaser(vk)
++        );
++    }
+     backend::makeLeaking();
+     return resources;
+ }
+@@ -242,11 +249,13 @@ void Swapchain::commitFrameGenerationResources(
+     retiring.sourceImages = std::move(this->sourceImages);
+     retiring.destinationImages = std::move(this->destinationImages);
+     retiring.syncSemaphore = std::move(this->syncSemaphore);
++    retiring.anvilRenderBoundary = std::move(this->anvilRenderBoundary);
+     retiring.context = std::move(this->ctx);
+ 
+     this->sourceImages = std::move(resources.sourceImages);
+     this->destinationImages = std::move(resources.destinationImages);
+     this->syncSemaphore = std::move(resources.syncSemaphore);
++    this->anvilRenderBoundary = std::move(resources.anvilRenderBoundary);
+     this->ctx = std::move(resources.context);
+     this->frameGenerationHdrReducedPrecision = resources.hdrReducedPrecision;
+     // The scaler and FG prepare independently. A pending scaler still owns
+@@ -260,6 +269,9 @@ void Swapchain::commitFrameGenerationResources(
+     );
+ 
+     this->frameState.backendTimelineIndex = 1;
++    this->recoveryState.anvilOutputPending = 0;
++    this->recoveryState.anvilSourceReuseValue = 0;
++    this->recoveryState.anvilWorkerStopped = false;
+     this->frameState.backendFrameIndex = 0;
+     this->frameState.backendSourceCadence.reset();
+     this->frameState.renderFenceInFlight = false;
+diff --git a/engine/mako-render/src/swapchain/swapchain.hpp b/engine/mako-render/src/swapchain/swapchain.hpp
+index 5171854e78e8f5c47e25aabdf2892dda2a27c800..9ef4e3576fd8175bcc1c549571734661957058b3 100644
+--- a/engine/mako-render/src/swapchain/swapchain.hpp
++++ b/engine/mako-render/src/swapchain/swapchain.hpp
+@@ -381,6 +381,9 @@ namespace mako::layer {
+             PipelineBusyRecovery pipelineBusyRecovery;
+             ReplacementBackendStabilization replacementBackendStabilization;
+             bool backendPending{false};
++            uint64_t anvilOutputPending{0};
++            uint64_t anvilSourceReuseValue{0};
++            bool anvilWorkerStopped{false};
+             std::optional<std::chrono::steady_clock::time_point> lostBackendRetryAt;
+             bool lostBackendStopped{false};
+             uint32_t lostBackendFailures{0};
+@@ -440,6 +443,7 @@ namespace mako::layer {
+             std::vector<vk::Image> sourceImages;
+             std::vector<vk::Image> destinationImages;
+             ls::lazy<vk::TimelineSemaphore> syncSemaphore;
++            ls::lazy<vk::TimelineSemaphore> anvilRenderBoundary;
+             ls::owned_ptr<ls::R<backend::Context>> context;
+         };
+ 
+@@ -455,6 +459,7 @@ namespace mako::layer {
+         std::vector<vk::Image> sourceImages;
+         std::vector<vk::Image> destinationImages;
+         ls::lazy<vk::TimelineSemaphore> syncSemaphore;
++        ls::lazy<vk::TimelineSemaphore> anvilRenderBoundary;
+ 
+         ls::lazy<vk::CommandBuffer> renderCommandBuffer;
+         ls::lazy<vk::Fence> renderFence;
+@@ -618,10 +623,14 @@ namespace mako::layer {
+             const void* nextChain,
+             std::chrono::steady_clock::duration* duration = nullptr);
+         void submitSourceCopy(const PresentInvocation& invocation,
+-            VkImage swapchainImage, const vk::Image& sourceImage);
++            VkImage swapchainImage, const vk::Image& sourceImage,
++            uint64_t previousWorkerValue = 0);
+         [[nodiscard]] VkResult presentHistoryOnly(
+             const PresentInvocation& invocation,
+-            const PresentationFramePlan& plan);
++            const PresentationFramePlan& plan,
++            std::optional<uint64_t> scheduledSourceValue = std::nullopt);
++        [[nodiscard]] VkResult presentWithAnvilDeadline(
++            const PresentInvocation& invocation);
+ 
+         // Frame planning, resource readiness, and generated-image admission.
+         [[nodiscard]] bool recoverBackendIfReady(const vk::Vulkan& vk);
+@@ -637,7 +646,7 @@ namespace mako::layer {
+             const vk::Vulkan& vk, bool gamescopeHdrTransport,
+             const PresentationFramePlan& plan,
+             std::chrono::steady_clock::time_point presentNow);
+-        [[nodiscard]] bool prepareRenderFence(const vk::Vulkan& vk);
++        [[nodiscard]] bool prepareRenderFence(const vk::Vulkan& vk, bool poll = false);
+         void handleRenderFenceBudgetMiss(
+             const PresentationFramePlan& plan);
+         void preacquireGeneratedImages(
+diff --git a/engine/mako-common/include/mako-common/configuration/anvil_deadline.hpp b/engine/mako-common/include/mako-common/configuration/anvil_deadline.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f266394d6b6820678334b075d0eb307c7ba273cf
+--- /dev/null
++++ b/engine/mako-common/include/mako-common/configuration/anvil_deadline.hpp
+@@ -0,0 +1,59 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++
++#include <chrono>
++#include <cstdlib>
++#include <string_view>
++#include <vulkan/vulkan_core.h>
++
++namespace mako {
++    inline constexpr auto anvilPresentBudget = std::chrono::milliseconds(7);
++    inline constexpr auto anvilReadyWindowCeiling = 2 * anvilPresentBudget;
++    inline constexpr auto anvilScheduleReplyBudget = std::chrono::milliseconds(2);
++    inline constexpr VkImageUsageFlags anvilSourceImageUsage =
++        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++        VK_IMAGE_USAGE_SAMPLED_BIT;
++    inline constexpr VkImageUsageFlags anvilOutputImageUsage =
++        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
++
++    inline bool anvilDeadlineEnabled() noexcept {
++        static const bool enabled = [] {
++            const char* value = std::getenv("MAKO_ANVIL_DEADLINE");
++            return value && std::string_view(value) == "1";
++        }();
++        return enabled;
++    }
++
++    inline bool anvilRenderBoundaryEnabled() noexcept {
++        static const bool enabled = [] {
++            const char* value = std::getenv("MAKO_ANVIL_RENDER_BOUNDARY");
++            return anvilDeadlineEnabled() && value && std::string_view(value) == "1";
++        }();
++        return enabled;
++    }
++
++    inline bool anvilReadyWindowEnabled() noexcept {
++        static const bool enabled = [] {
++            const char* value = std::getenv("MAKO_ANVIL_READY_WINDOW");
++            return anvilRenderBoundaryEnabled() && value && std::string_view(value) == "1";
++        }();
++        return enabled;
++    }
++
++    inline bool anvilAsyncScheduleEnabled() noexcept {
++        static const bool enabled = [] {
++            const char* value = std::getenv("MAKO_ANVIL_ASYNC_SCHEDULE");
++            return anvilDeadlineEnabled() && value && std::string_view(value) == "1";
++        }();
++        return enabled;
++    }
++
++    inline bool anvilMotionEnabled() noexcept {
++        static const bool enabled = [] {
++            const char* value = std::getenv("MAKO_ANVIL_MOTION");
++            return anvilAsyncScheduleEnabled() && value && std::string_view(value) == "1";
++        }();
++        return enabled;
++    }
++}

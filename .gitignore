@@ -1,0 +1,15 @@
+/.venv/
+/local/
+/build/
+__pycache__/
+*.pyc
+*.onnx
+*.dlc
+*.bin
+*.spv
+*.so
+*.raw
+*.tar
+*.tar.gz
+*.zip
+*.log

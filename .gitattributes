@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.comp text eol=lf
+*.patch -text whitespace=-blank-at-eol

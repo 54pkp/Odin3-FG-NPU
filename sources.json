@@ -1,0 +1,7 @@
+{
+  "MAKO": {"url": "https://github.com/eugeniosegala/MAKO.git", "revision": "504611d42b73d33320456911e9bf92215dbb8cbf"},
+  "GSF_Kedavra": {"url": "https://github.com/wavessevaw/GSF_Kedavra.git", "revision": "b5818e5fd41fd7180aa3071e082b768c06807445"},
+  "Vulkan-Headers": {"url": "https://github.com/KhronosGroup/Vulkan-Headers.git", "revision": "c46850864f4661461b0f6cb9922c058ffea4915e"},
+  "vela": {"url": "https://github.com/54pkp/vela.git", "revision": "21691c731525f624b8e8e70cf735f37da5c5fffd"},
+  "anvil": {"url": "https://github.com/NihilDigit/anvil.git", "revision": "f701fd9b01b9fbb20822637b5d82cac626079e5f"}
+}
