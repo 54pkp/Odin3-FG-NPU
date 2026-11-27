@@ -74,8 +74,7 @@ tar -xzf /tmp/omnishift-sm8750-models.tar.gz -C ~/.local/share/odin3-fg/models
 cp runtime/install_runtime.py ~/.local/share/odin3-fg/install_runtime.py
 RT_SHA=$(sha256sum /tmp/odin3-fg-runtime.tar | awk '{print $1}')
 python3 -I ~/.local/share/odin3-fg/install_runtime.py stage /tmp/odin3-fg-runtime.tar --sha256 "$RT_SHA"
-python3 -I ~/.local/share/odin3-fg/install_runtime.py activate "$RT_SHA" -- \
-    /usr/bin/test -x ~/.local/share/odin3-fg/versions/"$RT_SHA"/odin3-fg-worker
+python3 -I ~/.local/share/odin3-fg/install_runtime.py activate "$RT_SHA"
 
 # 3. Install both Decky plugins and restart Decky Loader
 sudo unzip -oq /tmp/odin3-fg-npu-decky.zip -d ~/homebrew/plugins/
