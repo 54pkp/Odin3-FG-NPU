@@ -1,0 +1,18 @@
+{
+  "name": "Odin3 NPU Power",
+  "author": "54pkp",
+  "flags": [
+    "root"
+  ],
+  "api_version": 1,
+  "publish": {
+    "tags": [
+      "npu",
+      "power",
+      "sm8750",
+      "odin3",
+      "hexagon-htp"
+    ],
+    "description": "Odin 3 Hexagon NPU performance / power tiers (QNN HTP DCVS v3 governor)"
+  }
+}

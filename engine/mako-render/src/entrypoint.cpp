@@ -1,0 +1,4321 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+#include "instance.hpp"
+#include "gamescope_scaling_surface.hpp"
+#include "independent_real_present.hpp"
+#include "color_pipeline.hpp"
+#include "layer_role.hpp"
+#include "mako-common/configuration/htp_deadline.hpp"
+#include "mako-common/helpers/errors.hpp"
+#include "mako-common/helpers/pointers.hpp"
+#include "mako-common/vulkan/vulkan.hpp"
+#include "mako-common/vulkan/device_features.hpp"
+#include "present_diagnostics.hpp"
+#include "swapchain/swapchain.hpp"
+#include "swapchain/application_acquire_budget.hpp"
+#include "swapchain/create_policy.hpp"
+#include "swapchain/retirement.hpp"
+#include "x11_presentation_target.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <dlfcn.h>
+#include <link.h>
+#include <optional>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <new>
+#include <string_view>
+#include <string>
+#include <thread>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include <vulkan/vk_layer.h>
+#include <vulkan/vulkan_core.h>
+
+// Platform surface create-info types are opaque here: MAKO only forwards the
+// structures and records which entrypoint produced the resulting handle. This
+// avoids making the Renderer link against X11, XCB, or Wayland client APIs.
+struct VkWaylandSurfaceCreateInfoKHR;
+struct VkXcbSurfaceCreateInfoKHR;
+struct VkXlibSurfaceCreateInfoKHR;
+
+using namespace mako::layer;
+
+namespace {
+    PFN_vkVoidFunction myvkGetInstanceProcAddr(VkInstance instance, const char* name);
+
+    bool independentRealRequested() {
+        const char* value = std::getenv("ODIN3_HTP_INDEPENDENT_REAL");
+        return frameGenerationLayer && value && std::string_view(value) == "1";
+    }
+
+    // global layer info initialized at layer negotiation
+    struct LayerInfo {
+        std::unordered_map<std::string, PFN_vkVoidFunction> map; //!< function pointer override map
+        PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
+
+        Root root;
+    }* layer_info; // NOLINT (global variable)
+
+    std::recursive_mutex& lifecycleMutex() noexcept {
+        static auto* m = new std::recursive_mutex();
+        return *m;
+    }
+    std::shared_mutex& registryMutex() noexcept {
+        static auto* m = new std::shared_mutex();
+        return *m;
+    }
+
+    // instance-wide info initialized at instance creation(s)
+    struct InstanceInfo {
+        std::vector<VkInstance> handles; // there may be several instances
+        vk::VulkanInstanceFuncs funcs;
+        std::string engineName;
+        std::unique_ptr<GamescopeScalingSurface> scalingSurfaces;
+        SurfaceMaintenance1Support surfaceMaintenance1;
+        bool surfaceCapabilities2{false};
+
+        std::unordered_map<VkDevice, vk::Vulkan> devices;
+        std::unordered_set<VkDevice> nativeDevices;
+        std::unordered_set<VkDevice> presentRetirementDevices;
+        std::unordered_set<VkDevice> gamescopeTimingDevices;
+        std::unordered_set<VkDevice> presentTimingDevices;
+        std::unordered_set<VkDevice> hdrMetadataDevices;
+        std::unordered_set<VkDevice> lowerHdrMetadataDevices;
+        struct QueueIdentity {
+            VkDevice device{VK_NULL_HANDLE};
+            uint32_t familyIndex{UINT32_MAX};
+        };
+        std::unordered_map<VkQueue, QueueIdentity> queueIdentities;
+        struct SurfaceScalingEligibility {
+            bool supported{false};
+            bool queueSupported{false};
+            uint32_t advertisedFormatCount{0};
+            uint32_t compatibleFormatCount{0};
+        };
+        std::mutex surfaceScalingMutex;
+        std::unordered_map<
+            VkPhysicalDevice,
+            std::unordered_map<VkSurfaceKHR, SurfaceScalingEligibility>
+        > surfaceScalingEligibility;
+        uint64_t nextSurfaceScalingQueryGeneration{1};
+        std::unordered_map<
+            VkPhysicalDevice,
+            std::unordered_map<VkSurfaceKHR, FixedSurfaceScalingContract>
+        > fixedSurfaceScalingContracts;
+        std::unordered_map<VkSurfaceKHR, SpatialScalingExtents>
+            variableSurfaceScalingExtents;
+        std::unordered_map<VkSurfaceKHR, SpatialScalingExtents>
+            variableSurfaceRollbackExtents;
+        std::unordered_map<VkSurfaceKHR, SpatialSurfaceOrigin> surfaceOrigins;
+        std::unordered_map<VkSurfaceKHR, X11PresentationTarget>
+            x11PresentationTargets;
+        std::unordered_set<VkSurfaceKHR> unprovenSplitSurfacesLogged;
+        std::unordered_map<
+            VkSurfaceKHR, ScalingAdmissionRetrySurfaceBudget
+        > scalingAdmissionRetryStates;
+        std::unordered_map<VkSwapchainKHR, ls::R<vk::Vulkan>> swapchains;
+        std::unordered_map<VkInstance, PrivateDeviceCallbacks> privateDeviceCallbacks;
+        std::unordered_map<VkSwapchainKHR, std::unique_ptr<IndependentRealPresent>> independentRealSwapchains;
+        std::unordered_set<VkSurfaceKHR> independentRealRejectedSurfaces;
+        std::unordered_map<VkSwapchainKHR, SwapchainInfo> swapchainInfos;
+        std::unordered_set<VkSwapchainKHR> nativeSwapchains;
+        // Zink acquires on its GL thread and presents on a worker, so these
+        // budgets are shared across threads under their own lock.
+        std::mutex acquireBudgetsMutex;
+        std::unordered_map<VkSwapchainKHR,
+            std::shared_ptr<ApplicationAcquireBudget>> acquireBudgets;
+        std::atomic<bool> acquireBudgetsPresent{false};
+        // Wine keeps its own instance alive while a game's renderer, such as
+        // Zink, creates another, so the process-wide engine name can describe
+        // the wrong instance. Devices take the name of their own instance,
+        // found through the dispatch key a physical device shares with it.
+        std::unordered_map<const void*, std::string> instanceEngineNames;
+        std::unordered_map<VkDevice, std::string> deviceEngineNames;
+        struct RetiredSwapchain {
+            VkDevice device{VK_NULL_HANDLE};
+            VkSurfaceKHR surface{VK_NULL_HANDLE};
+            ls::R<vk::Vulkan> vk;
+            std::optional<Swapchain> context;
+            std::chrono::steady_clock::time_point notBefore{};
+        };
+        std::atomic_size_t retiredSwapchainCount{0};
+        std::mutex retiredSwapchainsMutex;
+        std::unordered_map<VkSwapchainKHR, RetiredSwapchain>
+            retiredSwapchains;
+        // Lower commands called after vkCreateInstance returns, resolved
+        // while each instance was being created.
+        std::unordered_map<VkInstance,
+            std::unordered_map<std::string_view, PFN_vkVoidFunction>>
+            lowerInstanceCommands;
+        std::unordered_map<VkInstance, PFN_vkGetInstanceProcAddr> instNextGpa;
+        std::unordered_map<VkInstance, vk::VulkanInstanceFuncs> instFuncsMap;
+        std::unordered_map<VkDevice, PFN_vkGetDeviceProcAddr> devNextGpa;
+    }* instance_info; // NOLINT (global variable)
+
+    const void* dispatchKey(const void* handle) {
+        return handle ? *static_cast<const void* const*>(handle) : nullptr;
+    }
+
+    VkInstance ownerInstanceForPhysicalDevice(VkPhysicalDevice physicalDevice) noexcept {
+        const std::shared_lock regLock(registryMutex());
+        if (!instance_info || instance_info->handles.empty())
+            return VK_NULL_HANDLE;
+        if (physicalDevice) {
+            const auto found = std::ranges::find_if(instance_info->handles, [&](VkInstance handle) {
+                return dispatchKey(handle) == dispatchKey(physicalDevice);
+            });
+            if (found != instance_info->handles.end())
+                return *found;
+        }
+        return instance_info->handles.front();
+    }
+
+    vk::VulkanInstanceFuncs funcsForPhysicalDevice(VkPhysicalDevice physicalDevice) noexcept {
+        const std::shared_lock regLock(registryMutex());
+        if (!instance_info)
+            return {};
+        if (physicalDevice) {
+            const auto found = std::ranges::find_if(instance_info->handles, [&](VkInstance handle) {
+                return dispatchKey(handle) == dispatchKey(physicalDevice);
+            });
+            if (found != instance_info->handles.end()) {
+                const auto fIt = instance_info->instFuncsMap.find(*found);
+                if (fIt != instance_info->instFuncsMap.end())
+                    return fIt->second;
+            }
+        }
+        if (!instance_info->handles.empty()) {
+            const auto fIt = instance_info->instFuncsMap.find(instance_info->handles.front());
+            if (fIt != instance_info->instFuncsMap.end())
+                return fIt->second;
+        }
+        return instance_info->funcs;
+    }
+
+    PFN_vkGetDeviceProcAddr nextDeviceProcAddrFor(VkDevice device) noexcept {
+        const std::shared_lock regLock(registryMutex());
+        if (!instance_info)
+            return nullptr;
+        if (device) {
+            const auto dIt = instance_info->devNextGpa.find(device);
+            if (dIt != instance_info->devNextGpa.end() && dIt->second)
+                return dIt->second;
+        }
+        return instance_info->funcs.GetDeviceProcAddr;
+    }
+
+    const std::string& deviceEngineName(const VkDevice device) {
+        const auto found = instance_info->deviceEngineNames.find(device);
+        return found == instance_info->deviceEngineNames.end()
+            ? instance_info->engineName : found->second;
+    }
+
+    // Loaders before Vulkan-Loader's terminator fix, such as 1.3.239 in
+    // Steam's runtime, answer a lookup made after vkCreateInstance returns
+    // from the instance's top-level dispatch table: the lower chain hands back
+    // this layer's own hook, which then calls itself until the stack
+    // overflows. These are the instance commands this layer looks up late.
+    constexpr std::array lateLowerInstanceCommands{
+        "vkCreateWaylandSurfaceKHR",
+        "vkCreateXcbSurfaceKHR",
+        "vkCreateXlibSurfaceKHR",
+        "vkDestroySurfaceKHR",
+        "vkGetPhysicalDeviceSurfaceCapabilities2KHR",
+        "vkGetPhysicalDeviceSurfaceFormats2KHR",
+    };
+
+    // The lower chain's vkGetInstanceProcAddr, serving the commands above
+    // from the entry points resolved at instance creation.
+    PFN_vkVoidFunction VKAPI_CALL lowerInstanceProcAddr(
+            VkInstance instance, const char* name) {
+        PFN_vkGetInstanceProcAddr nextInstGpa = nullptr;
+        if (name) {
+            const std::shared_lock regLock(registryMutex());
+            if (instance_info) {
+                const auto commands =
+                    instance_info->lowerInstanceCommands.find(instance);
+                if (commands != instance_info->lowerInstanceCommands.end()) {
+                    const auto command = commands->second.find(name);
+                    if (command != commands->second.end())
+                        return command->second;
+                }
+                const auto gIt = instance_info->instNextGpa.find(instance);
+                if (gIt != instance_info->instNextGpa.end())
+                    nextInstGpa = gIt->second;
+            }
+            if (!nextInstGpa && layer_info)
+                nextInstGpa = layer_info->GetInstanceProcAddr;
+        }
+        return nextInstGpa ? nextInstGpa(instance, name) : nullptr;
+    }
+
+    enum class FixedSurfaceCapabilityRelayOperation : uint32_t {
+        BeginCapability,
+        ConsumeCapability,
+        BeginCreate,
+        ConsumeCreate,
+    };
+
+#if defined(MAKO_LAYER_ROLE_SPATIAL_SCALING)
+    thread_local FixedSurfaceCapabilityRelaySlot fixedSurfaceCapabilityRelay;
+    thread_local FixedSurfaceCapabilityRelaySlot spatialCreateRelay;
+#endif
+
+    bool initializeLayerInfo();
+
+    bool finalizeRetiredSwapchain(
+            const VkSwapchainKHR swapchain, const uint64_t timeoutNs,
+            const std::string_view trigger) {
+        const auto retirementLock = lockSwapchainRetirement(
+            instance_info->retiredSwapchainsMutex, timeoutNs
+        );
+        if (!retirementLock.owns_lock())
+            return false;
+        const auto retired = instance_info->retiredSwapchains.find(swapchain);
+        if (retired == instance_info->retiredSwapchains.end())
+            return true;
+        uint64_t remainingTimeoutNs = timeoutNs;
+        const auto now = std::chrono::steady_clock::now();
+        if (now < retired->second.notBefore) {
+            if (timeoutNs == 0)
+                return false;
+            const auto delay = std::chrono::duration_cast<
+                std::chrono::nanoseconds>(
+                    retired->second.notBefore - now
+                );
+            if (timeoutNs != UINT64_MAX &&
+                    static_cast<uint64_t>(delay.count()) > timeoutNs) {
+                return false;
+            }
+            std::this_thread::sleep_for(delay);
+            if (timeoutNs != UINT64_MAX)
+                remainingTimeoutNs -= static_cast<uint64_t>(delay.count());
+        }
+        if (retired->second.context &&
+                !retired->second.context->waitForPresentRetirement(
+                    retired->second.vk.get(), remainingTimeoutNs
+                )) {
+            return false;
+        }
+
+        auto node = instance_info->retiredSwapchains.extract(retired);
+        auto& state = node.mapped();
+        state.context.reset();
+        state.vk.get().df().DestroySwapchainKHR(
+            state.device, swapchain, VK_NULL_HANDLE
+        );
+        instance_info->retiredSwapchainCount.fetch_sub(
+            1, std::memory_order_acq_rel
+        );
+        if (present_diagnostics::enabled()) {
+            std::cerr << "MAKO Renderer: present diagnostics: "
+                         "operation=swapchain-retirement-complete"
+                      << " role=" << layerRoleName
+                      << " swapchain=" << swapchain
+                      << " trigger=" << trigger
+                      << " pending="
+                      << instance_info->retiredSwapchains.size() << '\n';
+        }
+        return true;
+    }
+
+    void collectRetiredSwapchains(
+            const VkDevice device, const uint64_t timeoutNs,
+            const std::string_view trigger) {
+        if (instance_info->retiredSwapchainCount.load(
+                std::memory_order_acquire) == 0) {
+            return;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        std::vector<VkSwapchainKHR> candidates;
+        {
+            const std::lock_guard retirementLock(
+                instance_info->retiredSwapchainsMutex
+            );
+            candidates.reserve(instance_info->retiredSwapchains.size());
+            for (const auto& [swapchain, retired] :
+                    instance_info->retiredSwapchains) {
+                if (retired.device == device)
+                    candidates.push_back(swapchain);
+            }
+        }
+        for (const auto swapchain : candidates) {
+            uint64_t remainingTimeoutNs = timeoutNs;
+            if (timeoutNs != UINT64_MAX) {
+                const auto elapsed = std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - started
+                    ).count();
+                remainingTimeoutNs = elapsed >=
+                        static_cast<int64_t>(timeoutNs)
+                    ? 0
+                    : timeoutNs - static_cast<uint64_t>(elapsed);
+            }
+            static_cast<void>(finalizeRetiredSwapchain(
+                swapchain, remainingTimeoutNs, trigger
+            ));
+        }
+    }
+
+    void collectRetiredSwapchainsAfterPresent(
+            const VkQueue queue, const VkPresentInfoKHR& presentInfo) {
+        if (instance_info->retiredSwapchainCount.load(
+                std::memory_order_acquire) == 0) {
+            return;
+        }
+        const auto queueIdentity = instance_info->queueIdentities.find(queue);
+        if (queueIdentity == instance_info->queueIdentities.end())
+            return;
+        const auto device = queueIdentity->second.device;
+        std::vector<VkSwapchainKHR> candidates;
+        {
+            const auto retirementLock = lockSwapchainRetirement(
+                instance_info->retiredSwapchainsMutex, 0
+            );
+            if (!retirementLock.owns_lock())
+                return;
+            candidates.reserve(instance_info->retiredSwapchains.size());
+            for (const auto& [retiredHandle, retired] :
+                    instance_info->retiredSwapchains) {
+                if (retired.device != device)
+                    continue;
+                for (uint32_t index = 0;
+                        index < presentInfo.swapchainCount; ++index) {
+                    const auto live = instance_info->swapchainInfos.find(
+                        presentInfo.pSwapchains[index]
+                    );
+                    if (live != instance_info->swapchainInfos.end() &&
+                            retiredSwapchainBelongsToSurface(
+                                retired.surface, live->second.surface)) {
+                        candidates.push_back(retiredHandle);
+                        break;
+                    }
+                }
+            }
+        }
+        for (const auto swapchain : candidates) {
+            static_cast<void>(finalizeRetiredSwapchain(
+                swapchain, 0, "same-surface-present"
+            ));
+        }
+    }
+
+    std::optional<VkSwapchainKHR>
+    retainedSwapchainBeforeNullOldReplacement(
+            const VkDevice device, const VkSurfaceKHR surface,
+            const VkSwapchainKHR requestedOldSwapchain) {
+        const std::lock_guard retirementLock(
+            instance_info->retiredSwapchainsMutex
+        );
+        for (const auto& [swapchain, retired] :
+                instance_info->retiredSwapchains) {
+            if (!shouldRetireRetainedSwapchainBeforeNullOldReplacement(
+                    requestedOldSwapchain,
+                    device,
+                    surface,
+                    retired.device,
+                    retired.surface)) {
+                continue;
+            }
+            return swapchain;
+        }
+        return std::nullopt;
+    }
+
+    void forceFinalizeRetiredSwapchains(const VkDevice device) {
+        std::vector<VkSwapchainKHR> candidates;
+        {
+            const std::lock_guard retirementLock(
+                instance_info->retiredSwapchainsMutex
+            );
+            for (const auto& [swapchain, retired] :
+                    instance_info->retiredSwapchains) {
+                if (retired.device == device)
+                    candidates.push_back(swapchain);
+            }
+        }
+        for (const auto swapchain : candidates) {
+            const std::lock_guard retirementLock(
+                instance_info->retiredSwapchainsMutex
+            );
+            auto node = instance_info->retiredSwapchains.extract(swapchain);
+            if (node.empty())
+                continue;
+            auto& state = node.mapped();
+            std::cerr << "MAKO Renderer: forcing pending swapchain retirement "
+                         "during device destruction\n";
+            state.context.reset();
+            state.vk.get().df().DestroySwapchainKHR(
+                state.device, swapchain, VK_NULL_HANDLE
+            );
+            instance_info->retiredSwapchainCount.fetch_sub(
+                1, std::memory_order_acq_rel
+            );
+        }
+    }
+
+    void collectRetiredSwapchainsForSurface(const VkSurfaceKHR surface) {
+        if (instance_info->retiredSwapchainCount.load(
+                std::memory_order_acquire) == 0) {
+            return;
+        }
+        std::vector<VkSwapchainKHR> candidates;
+        {
+            const std::lock_guard retirementLock(
+                instance_info->retiredSwapchainsMutex
+            );
+            candidates.reserve(instance_info->retiredSwapchains.size());
+            for (const auto& [swapchain, retired] :
+                    instance_info->retiredSwapchains) {
+                if (retiredSwapchainBelongsToSurface(
+                        retired.surface, surface)) {
+                    candidates.push_back(swapchain);
+                }
+            }
+        }
+        for (const auto swapchain : candidates)
+            static_cast<void>(finalizeRetiredSwapchain(
+                swapchain, UINT64_MAX, "surface-destroy"
+            ));
+    }
+
+    std::optional<uint32_t> selectLayerQueueFamily(
+            const VkPhysicalDevice physicalDevice,
+            const VkDeviceCreateInfo& createInfo,
+            const bool spatialScalingConfigured) {
+        uint32_t familyCount{};
+        instance_info->funcs.GetPhysicalDeviceQueueFamilyProperties(
+            physicalDevice, &familyCount, nullptr
+        );
+        std::vector<VkQueueFamilyProperties> families(familyCount);
+        instance_info->funcs.GetPhysicalDeviceQueueFamilyProperties(
+            physicalDevice, &familyCount, families.data()
+        );
+        const VkQueueFlags required = VK_QUEUE_GRAPHICS_BIT |
+            (spatialScalingConfigured ? VK_QUEUE_COMPUTE_BIT : 0);
+        for (uint32_t i = 0; i < createInfo.queueCreateInfoCount; ++i) {
+            const auto& requested = createInfo.pQueueCreateInfos[i];
+            if (requested.queueCount == 0 || requested.flags != 0 ||
+                    requested.queueFamilyIndex >= familyCount) {
+                continue;
+            }
+            if ((families.at(requested.queueFamilyIndex).queueFlags &
+                    required) == required) {
+                return requested.queueFamilyIndex;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<const char*> supportedSwapchainMaintenance1Extension(
+            const VkPhysicalDevice physicalDevice,
+            const bool presentationResourcesProvisioned) {
+        if (!presentationResourcesProvisioned ||
+                !instance_info->funcs.GetPhysicalDeviceFeatures2) {
+            return std::nullopt;
+        }
+
+        uint32_t extensionCount{};
+        auto result = instance_info->funcs.EnumerateDeviceExtensionProperties(
+            physicalDevice, nullptr, &extensionCount, nullptr
+        );
+        if (result != VK_SUCCESS)
+            return std::nullopt;
+        std::vector<VkExtensionProperties> extensions(extensionCount);
+        result = instance_info->funcs.EnumerateDeviceExtensionProperties(
+            physicalDevice, nullptr, &extensionCount, extensions.data()
+        );
+        if (result != VK_SUCCESS)
+            return std::nullopt;
+
+        const auto hasExtension = [&](const char* const name) {
+            return std::ranges::any_of(
+                extensions,
+                [name](const VkExtensionProperties& extension) {
+                    return std::strcmp(extension.extensionName, name) == 0;
+                }
+            );
+        };
+        const bool hasKhr = hasExtension(
+            khrSwapchainMaintenance1ExtensionName
+        ) && instance_info->surfaceMaintenance1.khr;
+        const bool hasExt = hasExtension(
+            VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME
+        ) && instance_info->surfaceMaintenance1.ext;
+        if (!hasKhr && !hasExt)
+            return std::nullopt;
+
+        VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance1{
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
+        };
+        VkPhysicalDeviceFeatures2 features{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &maintenance1,
+        };
+        instance_info->funcs.GetPhysicalDeviceFeatures2(
+            physicalDevice, &features
+        );
+        const char* const selected = selectSwapchainMaintenance1Extension(
+            hasKhr, hasExt, maintenance1.swapchainMaintenance1 == VK_TRUE
+        );
+        if (!selected)
+            return std::nullopt;
+        return selected;
+    }
+
+    bool supportedGamescopeDisplayTiming(const VkPhysicalDevice physicalDevice,
+            const VkDeviceCreateInfo& createInfo) {
+        if (!rendererOwnsDisplayTiming(createInfo,
+                layer_info->root.gamescopeWsiTimingProvisioned(), true))
+            return false;
+        uint32_t count{};
+        if (instance_info->funcs.EnumerateDeviceExtensionProperties(
+                physicalDevice, nullptr, &count, nullptr) != VK_SUCCESS)
+            return false;
+        std::vector<VkExtensionProperties> extensions(count);
+        if (instance_info->funcs.EnumerateDeviceExtensionProperties(
+                physicalDevice, nullptr, &count, extensions.data()) != VK_SUCCESS)
+            return false;
+        extensions.resize(count);
+        return std::ranges::any_of(extensions, [](const auto& extension) {
+            return std::string_view(extension.extensionName) ==
+                VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME;
+        });
+    }
+
+    // create instance
+    VkResult myvkCreateInstance(
+            const VkInstanceCreateInfo* info,
+            const VkAllocationCallbacks* alloc,
+            VkInstance* instance) {
+        const std::lock_guard lifeLock(lifecycleMutex());
+        // apply layer chaining
+        auto* layerInfo = reinterpret_cast<VkLayerInstanceCreateInfo*>(const_cast<void*>(info->pNext));
+        while (layerInfo && (layerInfo->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO
+                || layerInfo->function != VK_LAYER_LINK_INFO)) {
+            layerInfo = reinterpret_cast<VkLayerInstanceCreateInfo*>(const_cast<void*>(layerInfo->pNext));
+        }
+        if (!layerInfo) {
+            std::cerr << "MAKO Renderer: no layer info found in pNext chain, "
+                "the previous layer does not follow spec\n";
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        auto* linkInfo = layerInfo->u.pLayerInfo;
+        if (!linkInfo) {
+            std::cerr << "MAKO Renderer: link info is null, "
+                "the previous layer does not follow spec\n";
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        layer_info->GetInstanceProcAddr = linkInfo->pfnNextGetInstanceProcAddr;
+        if (!layer_info->GetInstanceProcAddr) {
+            std::cerr << "MAKO Renderer: next layer's vkGetInstanceProcAddr is null, "
+                "the previous layer does not follow spec\n";
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        layerInfo->u.pLayerInfo = linkInfo->pNext; // advance for next layer
+
+        // create instance
+        auto* vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(
+            layer_info->GetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance"));
+        if (!vkCreateInstance) {
+            std::cerr << "MAKO Renderer: failed to get next layer's vkCreateInstance, "
+                "the previous layer does not follow spec\n";
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        bool lowerInstanceCreated = false;
+        const auto rollbackCreatedInstance = [&]() noexcept {
+            if (!lowerInstanceCreated || !instance || *instance == VK_NULL_HANDLE)
+                return;
+
+            auto* vkDestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(
+                layer_info->GetInstanceProcAddr(*instance, "vkDestroyInstance"));
+            if (vkDestroyInstance) {
+                vkDestroyInstance(*instance, alloc);
+                *instance = VK_NULL_HANDLE;
+            } else {
+                std::cerr << "MAKO Renderer: failed to roll back a lower Vulkan instance "
+                             "after layer initialization failed\n";
+            }
+            lowerInstanceCreated = false;
+        };
+        const auto releaseIdleLayerState = []() noexcept {
+            if (instance_info)
+                return;
+            delete layer_info; // NOLINT (memory management)
+            layer_info = nullptr;
+        };
+
+        try {
+            std::unique_ptr<GamescopeScalingSurface> scalingSurfaces;
+            const auto environment = [](const char* name) -> std::string_view {
+                const char* value = std::getenv(name);
+                return value ? value : "";
+            };
+            const bool needsX11Adapter = requestsGamescopeScalingSurface(*info);
+            const bool retirementRequested = independentRealRequested() || presentationRetirementRequired(
+                layer_info->root.frameGenerationInteropProvisioned(),
+                layer_info->root.scalingEngineProvisioned(),
+                layer_info->root.scalingSurfaceConnectionProvisioned());
+            InstanceExtensionQuery extensionQuery;
+            if (retirementRequested)
+                extensionQuery = queryPresentationInstanceExtensions(
+                    vk::enumerateLoaderInstanceExtensionProperties);
+            const auto& available = extensionQuery.properties;
+            if (!independentRealRequested() && needsX11Adapter && !(instance_info && instance_info->scalingSurfaces) &&
+                    needsGamescopeScalingSurface(
+                    layer_info->root.scalingSurfaceConnectionProvisioned(),
+                    true, spatialScalingLayer, splitLayerChainEnabled(),
+                    environment("GAMESCOPE_WAYLAND_DISPLAY"),
+                    environment("WAYLAND_DISPLAY"), environment("XDG_RUNTIME_DIR"),
+                    std::getenv("WAYLAND_SOCKET") != nullptr)) {
+                const bool waylandSupported = std::ranges::any_of(available,
+                    [](const VkExtensionProperties& extension) {
+                        return std::strcmp(extension.extensionName,
+                            "VK_KHR_wayland_surface") == 0;
+                    });
+                if (canAttemptGamescopeScalingSurface(
+                        extensionQuery.result, waylandSupported)) {
+                    auto candidate = std::make_unique<GamescopeScalingSurface>(
+                        layer_info->root.hdrExposureEnabled(),
+                        [](uint32_t gamescopePid) {
+                            return layer_info->root.queryGamescopeOutputHdr(gamescopePid);
+                        });
+                    if (candidate->connect())
+                        scalingSurfaces = std::move(candidate);
+                }
+                if (!scalingSurfaces)
+                    std::cerr << "MAKO Renderer: spatial scaling surface bridge unavailable; "
+                                 "retaining application surface extent checks\n";
+            }
+            VkInstanceCreateInfo newInfo = *info;
+            std::vector<const char*> extensions;
+            if (info->enabledExtensionCount)
+                extensions.assign(info->ppEnabledExtensionNames,
+                    info->ppEnabledExtensionNames + info->enabledExtensionCount);
+            const auto appendExtension = [&](const char* name) {
+                if (!std::ranges::any_of(extensions, [name](const char* existing) {
+                        return std::strcmp(existing, name) == 0;
+                    }))
+                    extensions.push_back(name);
+            };
+            const auto maintenance1 = surfaceMaintenance1Support(available);
+            if (independentRealRequested() && needsX11Adapter &&
+                    std::ranges::any_of(available, [](const auto& extension) {
+                        return std::string_view(extension.extensionName) == "VK_KHR_xcb_surface";
+                    })) appendExtension("VK_KHR_xcb_surface");
+            const bool timingCapabilities = retirementRequested &&
+                std::ranges::any_of(available, [](const auto& extension) {
+                    return std::string_view(extension.extensionName) == "VK_KHR_get_surface_capabilities2";
+                });
+            if (timingCapabilities) {
+                appendExtension("VK_KHR_surface");
+                appendExtension("VK_KHR_get_surface_capabilities2");
+            }
+            if (retirementRequested) {
+                if (maintenance1.khr || maintenance1.ext) {
+                    appendExtension("VK_KHR_surface");
+                    appendExtension("VK_KHR_get_surface_capabilities2");
+                    if (maintenance1.khr)
+                        appendExtension(khrSurfaceMaintenance1ExtensionName);
+                    if (maintenance1.ext)
+                        appendExtension(extSurfaceMaintenance1ExtensionName);
+                }
+            }
+            // Wine may keep several Vulkan instances alive. Every instance
+            // using the shared surface connection needs the driver extension.
+            if (needsX11Adapter && (scalingSurfaces ||
+                    (instance_info && instance_info->scalingSurfaces))) {
+                appendExtension("VK_KHR_wayland_surface");
+            }
+            newInfo.ppEnabledExtensionNames = extensions.data();
+            newInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+            layer_info->root.modifyInstanceCreateInfo(newInfo,
+                [&, newInfo = &newInfo]() {
+                    auto res = vkCreateInstance(newInfo, alloc, instance);
+                    if (res != VK_SUCCESS)
+                        throw ls::vulkan_error(res, "vkCreateInstance() failed");
+                    lowerInstanceCreated = true;
+                }
+            );
+
+            const auto createdInstFuncs = vk::initVulkanInstanceFuncs(*instance,
+                linkInfo->pfnNextGetInstanceProcAddr, true);
+            const std::unique_lock regCreateLock(registryMutex());
+            if (!instance_info)
+                instance_info = new InstanceInfo{ // NOLINT (memory management)
+                    .funcs = createdInstFuncs,
+                    .engineName = info->pApplicationInfo &&
+                            info->pApplicationInfo->pEngineName
+                        ? info->pApplicationInfo->pEngineName : "",
+                    .scalingSurfaces = std::move(scalingSurfaces),
+                    .surfaceMaintenance1 = maintenance1,
+                    .surfaceCapabilities2 = timingCapabilities,
+                };
+            else {
+                // Shared dispatch may serve several Wine instances. Only use
+                // a spelling whose prerequisites were enabled on every one.
+                instance_info->surfaceMaintenance1.khr &= maintenance1.khr;
+                instance_info->surfaceMaintenance1.ext &= maintenance1.ext;
+                instance_info->surfaceCapabilities2 &= timingCapabilities;
+                if (instance_info->engineName.empty() &&
+                        info->pApplicationInfo &&
+                        info->pApplicationInfo->pEngineName) {
+                    instance_info->engineName =
+                        info->pApplicationInfo->pEngineName;
+                }
+                if (scalingSurfaces)
+                    instance_info->scalingSurfaces = std::move(scalingSurfaces);
+            }
+
+            std::unordered_map<std::string_view, PFN_vkVoidFunction>
+                lowerCommands;
+            for (const std::string_view name : lateLowerInstanceCommands) {
+                if (const auto command = layer_info->GetInstanceProcAddr(
+                        *instance, name.data()))
+                    lowerCommands.emplace(name, command);
+            }
+            instance_info->lowerInstanceCommands.insert_or_assign(
+                *instance, std::move(lowerCommands));
+            if (independentRealRequested()) {
+                for (auto* current = static_cast<const VkBaseInStructure*>(info->pNext); current; current = current->pNext) {
+                    if (current->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO) continue;
+                    const auto* entry = reinterpret_cast<const VkLayerInstanceCreateInfo*>(current);
+                    if (entry->function != VK_LOADER_LAYER_CREATE_DEVICE_CALLBACK) continue;
+                    instance_info->privateDeviceCallbacks.emplace(*instance, PrivateDeviceCallbacks{
+                        entry->u.layerDevice.pfnLayerCreateDevice, entry->u.layerDevice.pfnLayerDestroyDevice,
+                        myvkGetInstanceProcAddr, linkInfo->pfnNextGetInstanceProcAddr});
+                    break;
+                }
+            }
+            const std::string instanceEngine =
+                info->pApplicationInfo && info->pApplicationInfo->pEngineName
+                    ? info->pApplicationInfo->pEngineName : "";
+            instance_info->instanceEngineNames.insert_or_assign(
+                dispatchKey(*instance), instanceEngine);
+            if (instance_info->handles.empty())
+                instance_info->funcs = createdInstFuncs;
+            instance_info->instNextGpa.insert_or_assign(*instance, linkInfo->pfnNextGetInstanceProcAddr);
+            instance_info->instFuncsMap.insert_or_assign(*instance, createdInstFuncs);
+            instance_info->handles.push_back(*instance);
+            if (present_diagnostics::enabled()) {
+                std::cerr << "MAKO Renderer: present diagnostics: "
+                             "operation=instance-engine"
+                          << " engine="
+                          << (instanceEngine.empty() ? "none" : instanceEngine)
+                          << " instances=" << instance_info->handles.size()
+                          << '\n';
+            }
+            lowerInstanceCreated = false;
+
+            return VK_SUCCESS;
+        } catch (const ls::vulkan_error& e) {
+            rollbackCreatedInstance();
+            releaseIdleLayerState();
+            if (e.error() == VK_ERROR_EXTENSION_NOT_PRESENT)
+                std::cerr << "MAKO Renderer: required Vulkan instance extensions are not present. "
+                    "Your GPU driver is not supported.\n";
+            return e.error();
+        } catch (const std::exception& e) {
+            rollbackCreatedInstance();
+            releaseIdleLayerState();
+            std::cerr << "MAKO Renderer: instance initialization failed:\n";
+            std::cerr << "- " << e.what() << '\n';
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+    }
+
+    // create device
+    bool bridgeHdrEnabled() {
+        return frameGenerationLayer && instance_info && instance_info->scalingSurfaces &&
+            instance_info->scalingSurfaces->hdrEnabled();
+    }
+
+    std::vector<VkExtensionProperties> lowerDeviceExtensions(VkPhysicalDevice physicalDevice) {
+        const auto instFuncs = funcsForPhysicalDevice(physicalDevice);
+        for (unsigned attempt = 0; attempt < 3; ++attempt) {
+            uint32_t count{};
+            auto result = instFuncs.EnumerateDeviceExtensionProperties(
+                physicalDevice, nullptr, &count, nullptr);
+            if (result != VK_SUCCESS || count > 4096)
+                throw ls::vulkan_error(result == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : result,
+                    "device extension enumeration failed");
+            std::vector<VkExtensionProperties> extensions(count);
+            result = instFuncs.EnumerateDeviceExtensionProperties(
+                physicalDevice, nullptr, &count, extensions.data());
+            if (result == VK_SUCCESS && count <= extensions.size()) {
+                extensions.resize(count);
+                return extensions;
+            }
+            if (result != VK_INCOMPLETE)
+                throw ls::vulkan_error(result, "device extension enumeration failed");
+        }
+        throw ls::vulkan_error(VK_INCOMPLETE, "device extensions changed during enumeration");
+    }
+
+    VkResult myvkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
+            const char* layerName, uint32_t* count, VkExtensionProperties* properties) {
+        const auto instFuncs = funcsForPhysicalDevice(physicalDevice);
+        if (!bridgeHdrEnabled() || (layerName && std::strcmp(layerName, "VK_LAYER_MAKO_render")))
+            return instFuncs.EnumerateDeviceExtensionProperties(
+                physicalDevice, layerName, count, properties);
+        try {
+            auto extensions = layerName ? std::vector<VkExtensionProperties>{}
+                : lowerDeviceExtensions(physicalDevice);
+            if (std::ranges::none_of(extensions, [](const auto& extension) {
+                    return std::strcmp(extension.extensionName, VK_EXT_HDR_METADATA_EXTENSION_NAME) == 0;
+                }))
+                extensions.push_back({VK_EXT_HDR_METADATA_EXTENSION_NAME, VK_EXT_HDR_METADATA_SPEC_VERSION});
+            if (!properties) {
+                *count = static_cast<uint32_t>(extensions.size());
+                return VK_SUCCESS;
+            }
+            const auto written = std::min(*count, static_cast<uint32_t>(extensions.size()));
+            std::copy_n(extensions.begin(), written, properties);
+            *count = written;
+            return written < extensions.size() ? VK_INCOMPLETE : VK_SUCCESS;
+        } catch (const ls::vulkan_error& error) {
+            return error.error();
+        } catch (...) {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+
+    void myvkGetPhysicalDeviceFeatures2(
+            VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2* features) {
+        const auto instFuncs = funcsForPhysicalDevice(physicalDevice);
+        if (instFuncs.GetPhysicalDeviceFeatures2)
+            instFuncs.GetPhysicalDeviceFeatures2(physicalDevice, features);
+        if (independentRealRequested()) {
+            // Prototype WSI lifetime belongs to the private device. The
+            // application must not depend on app-device presentation IDs or
+            // fences until their relay can run outside the game queue.
+            for (auto* entry = static_cast<VkBaseOutStructure*>(features->pNext); entry; entry = entry->pNext) {
+                switch (entry->sType) {
+                    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR:
+                        reinterpret_cast<VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR*>(entry)->swapchainMaintenance1 = VK_FALSE;
+                        break;
+                    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR:
+                        reinterpret_cast<VkPhysicalDevicePresentIdFeaturesKHR*>(entry)->presentId = VK_FALSE;
+                        break;
+                    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR:
+                        reinterpret_cast<VkPhysicalDevicePresentWaitFeaturesKHR*>(entry)->presentWait = VK_FALSE;
+                        break;
+                    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR:
+                        reinterpret_cast<VkPhysicalDevicePresentId2FeaturesKHR*>(entry)->presentId2 = VK_FALSE;
+                        break;
+                    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR:
+                        reinterpret_cast<VkPhysicalDevicePresentWait2FeaturesKHR*>(entry)->presentWait2 = VK_FALSE;
+                        break;
+                    default: break;
+                }
+            }
+        }
+    }
+
+    VkResult myvkCreateDevice(
+            VkPhysicalDevice physdev,
+            const VkDeviceCreateInfo* info,
+            const VkAllocationCallbacks* alloc,
+            VkDevice* device) {
+        const std::lock_guard lifeLock(lifecycleMutex());
+        {
+            const VkInstance physInst = ownerInstanceForPhysicalDevice(physdev);
+            const std::unique_lock syncLock(registryMutex());
+            if (instance_info && physInst) {
+                const auto fIt = instance_info->instFuncsMap.find(physInst);
+                if (fIt != instance_info->instFuncsMap.end())
+                    instance_info->funcs = fIt->second;
+            }
+        }
+        if (!layer_info || !instance_info) {
+            std::cerr << "MAKO Renderer: device creation requested before "
+                         "instance initialization\n";
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        // apply layer chaining
+        auto* layerInfo = reinterpret_cast<VkLayerDeviceCreateInfo*>(const_cast<void*>(info->pNext));
+        while (layerInfo && (layerInfo->sType != VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO
+                || layerInfo->function != VK_LAYER_LINK_INFO)) {
+            layerInfo = reinterpret_cast<VkLayerDeviceCreateInfo*>(const_cast<void*>(layerInfo->pNext));
+        }
+        if (!layerInfo) {
+            std::cerr << "MAKO Renderer: no layer info found in pNext chain, "
+                "the previous layer does not follow spec\n";
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        auto* linkInfo = layerInfo->u.pLayerInfo;
+        if (!linkInfo) {
+            std::cerr << "MAKO Renderer: link info is null, "
+                "the previous layer does not follow spec\n";
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        instance_info->funcs.GetDeviceProcAddr = linkInfo->pfnNextGetDeviceProcAddr;
+        if (!linkInfo->pfnNextGetDeviceProcAddr) {
+            std::cerr << "MAKO Renderer: next layer's vkGetDeviceProcAddr is null, "
+                "the previous layer does not follow spec\n";
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        layerInfo->u.pLayerInfo = linkInfo->pNext; // advance for next layer
+
+        // fetch device loader functions
+        layerInfo = reinterpret_cast<VkLayerDeviceCreateInfo*>(const_cast<void*>(info->pNext));
+        while (layerInfo && (layerInfo->sType != VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO
+                || layerInfo->function != VK_LOADER_DATA_CALLBACK)) {
+            layerInfo = reinterpret_cast<VkLayerDeviceCreateInfo*>(const_cast<void*>(layerInfo->pNext));
+        }
+        if (!layerInfo) {
+            std::cerr << "MAKO Renderer: no layer loader data found in pNext chain.\n";
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        auto* setLoaderData = layerInfo->u.pfnSetDeviceLoaderData;
+        if (!setLoaderData) {
+            std::cerr << "MAKO Renderer: instance loader data function is null.\n";
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        const bool presentationDevice =
+            swapchainPresentationEnabled(*info);
+        const bool frameGenerationInteropEnabled = presentationDevice &&
+            layer_info->root.frameGenerationInteropProvisioned();
+        const bool scalingEngineProvisioned = presentationDevice &&
+            layer_info->root.scalingEngineProvisioned();
+        const auto swapchainMaintenance1Extension =
+            supportedSwapchainMaintenance1Extension(
+                physdev, presentationDevice && (independentRealRequested() || presentationRetirementRequired(
+                    frameGenerationInteropEnabled, scalingEngineProvisioned,
+                    layer_info->root.scalingSurfaceConnectionProvisioned()))
+            );
+        const auto layerQueueFamily = presentationDevice
+            ? selectLayerQueueFamily(
+                physdev, *info, scalingEngineProvisioned
+            )
+            : std::nullopt;
+        bool ownedPresentTiming = false;
+#if defined(VK_EXT_present_timing) && defined(VK_KHR_present_id2)
+        if (frameGenerationInteropEnabled && instance_info->surfaceCapabilities2 &&
+                OwnedPresentTiming::ownsNamespace(*info) &&
+                instance_info->funcs.GetPhysicalDeviceFeatures2) {
+            const auto extensions = lowerDeviceExtensions(physdev);
+            const auto supported = [&](const char* name) {
+                return std::ranges::any_of(extensions, [name](const auto& extension) {
+                    return std::strcmp(extension.extensionName, name) == 0;
+                });
+            };
+            if (supported(VK_EXT_PRESENT_TIMING_EXTENSION_NAME) &&
+                    supported(VK_KHR_PRESENT_ID_2_EXTENSION_NAME) &&
+                    supported(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+                VkPhysicalDevicePresentId2FeaturesKHR ids{
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR,
+                };
+                VkPhysicalDevicePresentTimingFeaturesEXT timing{
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT,
+                    .pNext = &ids,
+                };
+                VkPhysicalDeviceFeatures2 features{
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                    .pNext = &timing,
+                };
+                instance_info->funcs.GetPhysicalDeviceFeatures2(physdev, &features);
+                ownedPresentTiming = ids.presentId2 && timing.presentTiming && timing.presentAtAbsoluteTime;
+            }
+        }
+#endif
+        const bool gamescopeDisplayTiming = presentationDevice &&
+            supportedGamescopeDisplayTiming(physdev, *info);
+        bool presentRetirementEnabled = false;
+        bool shaderFloat16Enabled = false;
+        bool storageWriteWithoutFormatEnabled = false;
+        bool hdrMetadataEnabled = false;
+        bool lowerHdrMetadataEnabled = false;
+        bool lowerDeviceCreated = false;
+        const auto rollbackCreatedDevice = [&]() noexcept {
+            if (!lowerDeviceCreated || !device || *device == VK_NULL_HANDLE)
+                return;
+
+            auto* vkDestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(
+                instance_info->funcs.GetDeviceProcAddr(
+                    *device, "vkDestroyDevice"
+                )
+            );
+            if (vkDestroyDevice) {
+                vkDestroyDevice(*device, alloc);
+                *device = VK_NULL_HANDLE;
+            } else {
+                std::cerr << "MAKO Renderer: failed to roll back a lower Vulkan device "
+                             "after layer initialization failed\n";
+            }
+            lowerDeviceCreated = false;
+        };
+
+        // create device
+        try {
+            VkDeviceCreateInfo newInfo = *info;
+            std::vector<const char*> precisionExtensions;
+            bool enableScalingFp16 = false;
+            if (scalingEngineProvisioned && layer_info->root.fp16RequestedAtStartup() &&
+                    instance_info->funcs.GetPhysicalDeviceFeatures2) {
+                uint32_t count{};
+                auto result = instance_info->funcs.EnumerateDeviceExtensionProperties(
+                    physdev, nullptr, &count, nullptr);
+                std::vector<VkExtensionProperties> supported(count);
+                if (result == VK_SUCCESS)
+                    result = instance_info->funcs.EnumerateDeviceExtensionProperties(
+                        physdev, nullptr, &count, supported.data());
+                const bool extensionSupported = result == VK_SUCCESS &&
+                    std::ranges::any_of(supported, [](const auto& extension) {
+                        return std::strcmp(extension.extensionName,
+                            VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) == 0;
+                    });
+                if (extensionSupported) {
+                    VkPhysicalDeviceShaderFloat16Int8Features half{
+                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+                    };
+                    VkPhysicalDeviceFeatures2 features{
+                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                        .pNext = &half,
+                    };
+                    instance_info->funcs.GetPhysicalDeviceFeatures2(physdev, &features);
+                    enableScalingFp16 = half.shaderFloat16 == VK_TRUE;
+                    if (enableScalingFp16) {
+                        if (info->enabledExtensionCount)
+                            precisionExtensions.assign(info->ppEnabledExtensionNames,
+                                info->ppEnabledExtensionNames + info->enabledExtensionCount);
+                        if (!std::ranges::any_of(precisionExtensions, [](const char* name) {
+                                return std::strcmp(name, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) == 0;
+                            }))
+                            precisionExtensions.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+                        newInfo.ppEnabledExtensionNames = precisionExtensions.data();
+                        newInfo.enabledExtensionCount = static_cast<uint32_t>(precisionExtensions.size());
+                    }
+                }
+            }
+            std::vector<const char*> hdrExtensions;
+            if (bridgeHdrEnabled()) {
+                for (uint32_t i = 0; i < newInfo.enabledExtensionCount; ++i) {
+                    const auto* name = newInfo.ppEnabledExtensionNames[i];
+                    if (std::strcmp(name, VK_EXT_HDR_METADATA_EXTENSION_NAME) == 0)
+                        hdrMetadataEnabled = true;
+                    hdrExtensions.push_back(name);
+                }
+                if (hdrMetadataEnabled) {
+                    const auto supported = lowerDeviceExtensions(physdev);
+                    lowerHdrMetadataEnabled = std::ranges::any_of(supported, [](const auto& extension) {
+                        return std::strcmp(extension.extensionName, VK_EXT_HDR_METADATA_EXTENSION_NAME) == 0;
+                    });
+                    if (!lowerHdrMetadataEnabled)
+                        std::erase_if(hdrExtensions, [](const char* name) {
+                            return std::strcmp(name, VK_EXT_HDR_METADATA_EXTENSION_NAME) == 0;
+                        });
+                    newInfo.ppEnabledExtensionNames = hdrExtensions.data();
+                    newInfo.enabledExtensionCount = static_cast<uint32_t>(hdrExtensions.size());
+                }
+            }
+            const vk::ShaderFloat16FeatureRequest precisionFeatures(newInfo, enableScalingFp16);
+            // MAKO Scaler writes an eligible swapchain image directly when its
+            // view can supply the storage format; otherwise it keeps the copy.
+            bool enableScalingDirectOutput = false;
+            if (scalingEngineProvisioned &&
+                    instance_info->funcs.GetPhysicalDeviceFeatures2) {
+                VkPhysicalDeviceFeatures2 supported{
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                };
+                instance_info->funcs.GetPhysicalDeviceFeatures2(physdev, &supported);
+                enableScalingDirectOutput =
+                    supported.features.shaderStorageImageWriteWithoutFormat == VK_TRUE;
+            }
+            const vk::StorageImageWriteWithoutFormatRequest directOutputFeatures(
+                newInfo, enableScalingDirectOutput);
+#if defined(VK_EXT_present_timing) && defined(VK_KHR_present_id2)
+            std::vector<const char*> timingExtensions;
+            VkPhysicalDevicePresentId2FeaturesKHR timingIds{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR,
+                .pNext = const_cast<void*>(newInfo.pNext),
+                .presentId2 = VK_TRUE,
+            };
+            VkPhysicalDevicePresentTimingFeaturesEXT timingFeatures{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT,
+                .pNext = &timingIds,
+                .presentTiming = VK_TRUE,
+                .presentAtAbsoluteTime = VK_TRUE,
+            };
+            if (ownedPresentTiming) {
+                for (uint32_t i = 0; i < newInfo.enabledExtensionCount; ++i)
+                    timingExtensions.push_back(newInfo.ppEnabledExtensionNames[i]);
+                for (const auto* name : {VK_EXT_PRESENT_TIMING_EXTENSION_NAME,
+                        VK_KHR_PRESENT_ID_2_EXTENSION_NAME, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME}) {
+                    if (!std::ranges::any_of(timingExtensions, [name](const auto* existing) {
+                            return std::strcmp(name, existing) == 0;
+                        }))
+                        timingExtensions.push_back(name);
+                }
+                newInfo.enabledExtensionCount = static_cast<uint32_t>(timingExtensions.size());
+                newInfo.ppEnabledExtensionNames = timingExtensions.data();
+                newInfo.pNext = &timingFeatures;
+            }
+#endif
+            std::vector<const char*> sharedSourceExtensions;
+            std::vector<VkDeviceQueueCreateInfo> lowPrioQueues;
+            std::vector<VkDeviceQueueGlobalPriorityCreateInfoKHR> lowPrioInfos;
+            if (independentRealRequested() && mako::htpVfiSharedSourcesEnabled()) {
+                constexpr std::array required{VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+                    VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME};
+                const auto supported = lowerDeviceExtensions(physdev);
+                const auto hasExt = [&](const char* name) {
+                    return std::ranges::any_of(supported, [name](const auto& ext) {
+                        return std::strcmp(name, ext.extensionName) == 0;
+                    });
+                };
+                if (std::ranges::all_of(required, hasExt)) {
+                    for (uint32_t i = 0; i < newInfo.enabledExtensionCount; ++i)
+                        sharedSourceExtensions.push_back(newInfo.ppEnabledExtensionNames[i]);
+                    for (const char* name : required) {
+                        if (!std::ranges::any_of(sharedSourceExtensions, [name](const char* ext) {
+                                return std::strcmp(name, ext) == 0;
+                            }))
+                            sharedSourceExtensions.push_back(name);
+                    }
+                    const char* lowPrioEnv = std::getenv("ODIN3_FG_APP_LOW_PRIORITY");
+                    if (presentationDevice && lowPrioEnv && std::strcmp(lowPrioEnv, "1") == 0 &&
+                            hasExt(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME) && newInfo.queueCreateInfoCount > 0) {
+                        if (!std::ranges::any_of(sharedSourceExtensions, [](const char* ext) {
+                                return std::strcmp(ext, VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME) == 0;
+                            }))
+                            sharedSourceExtensions.push_back(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME);
+                        lowPrioQueues.assign(newInfo.pQueueCreateInfos,
+                            newInfo.pQueueCreateInfos + newInfo.queueCreateInfoCount);
+                        lowPrioInfos.resize(lowPrioQueues.size());
+                        for (size_t qi = 0; qi < lowPrioQueues.size(); ++qi) {
+                            bool alreadyHasPrio = false;
+                            for (const auto* n = static_cast<const VkBaseInStructure*>(lowPrioQueues[qi].pNext); n; n = n->pNext) {
+                                if (n->sType == VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR) {
+                                    alreadyHasPrio = true;
+                                    break;
+                                }
+                            }
+                            if (!alreadyHasPrio) {
+                                lowPrioInfos[qi] = VkDeviceQueueGlobalPriorityCreateInfoKHR{
+                                    .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR,
+                                    .pNext = lowPrioQueues[qi].pNext,
+                                    .globalPriority = VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR,
+                                };
+                                lowPrioQueues[qi].pNext = &lowPrioInfos[qi];
+                            }
+                        }
+                        newInfo.pQueueCreateInfos = lowPrioQueues.data();
+                    }
+                    newInfo.enabledExtensionCount = static_cast<uint32_t>(sharedSourceExtensions.size());
+                    newInfo.ppEnabledExtensionNames = sharedSourceExtensions.data();
+                }
+            }
+            layer_info->root.modifyDeviceCreateInfo(
+                newInfo,
+                swapchainMaintenance1Extension.value_or(nullptr),
+                gamescopeDisplayTiming,
+                [&, newInfo = &newInfo]() {
+                    presentRetirementEnabled =
+                        swapchainMaintenance1Enabled(*newInfo);
+                    shaderFloat16Enabled = vk::shaderFloat16Enabled(newInfo->pNext);
+                    storageWriteWithoutFormatEnabled =
+                        vk::storageImageWriteWithoutFormatEnabled(*newInfo);
+                    auto res = instance_info->funcs.CreateDevice(physdev, newInfo, alloc, device);
+                    if (res != VK_SUCCESS)
+                        throw ls::vulkan_error(res, "vkCreateDevice() failed");
+                    lowerDeviceCreated = true;
+                }
+            );
+        } catch (const ls::vulkan_error& e) {
+            rollbackCreatedDevice();
+            if (e.error() == VK_ERROR_EXTENSION_NOT_PRESENT)
+                std::cerr << "MAKO Renderer: required Vulkan device extensions are not present. "
+                    "Your GPU driver is not supported.\n";
+            return e.error();
+        } catch (const std::exception& e) {
+            rollbackCreatedDevice();
+            std::cerr << "MAKO Renderer: device creation failed:\n";
+            std::cerr << "- " << e.what() << '\n';
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        const std::unique_lock regDevCreateLock(registryMutex());
+        instance_info->devNextGpa.insert_or_assign(*device, linkInfo->pfnNextGetDeviceProcAddr);
+        if (presentRetirementEnabled)
+            instance_info->presentRetirementDevices.insert(*device);
+        if (gamescopeDisplayTiming)
+            instance_info->gamescopeTimingDevices.insert(*device);
+        if (ownedPresentTiming)
+            instance_info->presentTimingDevices.insert(*device);
+        if (hdrMetadataEnabled)
+            instance_info->hdrMetadataDevices.insert(*device);
+        if (lowerHdrMetadataEnabled)
+            instance_info->lowerHdrMetadataDevices.insert(*device);
+
+        // No game profile matched when this device was created. Keep only the
+        // layer lifecycle hooks needed to chain and clean up correctly; all
+        // presentation entrypoints are forwarded directly by the GPA paths.
+        if (!layer_info->root.active() || !presentationDevice) {
+            instance_info->nativeDevices.insert(*device);
+            lowerDeviceCreated = false;
+            return VK_SUCCESS;
+        }
+
+        // create layer instance
+        bool layerDeviceInserted = false;
+        const auto discardLayerDevice = [&]() noexcept {
+            std::erase_if(
+                instance_info->queueIdentities,
+                [deviceHandle = *device](const auto& entry) {
+                    return entry.second.device == deviceHandle;
+                }
+            );
+            if (layerDeviceInserted) {
+                instance_info->devices.erase(*device);
+                layerDeviceInserted = false;
+            }
+            instance_info->presentRetirementDevices.erase(*device);
+            instance_info->gamescopeTimingDevices.erase(*device);
+            instance_info->presentTimingDevices.erase(*device);
+            instance_info->hdrMetadataDevices.erase(*device);
+            instance_info->lowerHdrMetadataDevices.erase(*device);
+        };
+        try {
+            if (!layerQueueFamily) {
+                throw ls::error(scalingEngineProvisioned
+                    ? "the application did not create an ordinary queue family "
+                      "with graphics and compute support"
+                    : "the application did not create an ordinary graphics queue family");
+            }
+            const auto ownerInst = std::ranges::find_if(instance_info->handles, [&](VkInstance handle) {
+                return dispatchKey(handle) == dispatchKey(physdev);
+            });
+            const VkInstance devInstance = (ownerInst != instance_info->handles.end())
+                ? *ownerInst : instance_info->handles.front();
+            vk::VulkanInstanceFuncs devInstFuncs = instance_info->funcs;
+            if (const auto fIt = instance_info->instFuncsMap.find(devInstance); fIt != instance_info->instFuncsMap.end())
+                devInstFuncs = fIt->second;
+            devInstFuncs.GetDeviceProcAddr = linkInfo->pfnNextGetDeviceProcAddr;
+            auto [wrapper, inserted] = instance_info->devices.emplace(
+                *device,
+                vk::Vulkan(
+                    devInstance, *device, physdev,
+                    devInstFuncs, vk::initVulkanDeviceFuncs(devInstFuncs, *device,
+                        true, frameGenerationInteropEnabled),
+                    *layerQueueFamily,
+                    frameGenerationInteropEnabled,
+                    true, setLoaderData, std::nullopt, shaderFloat16Enabled,
+                    storageWriteWithoutFormatEnabled
+                )
+            );
+            if (!inserted)
+                throw ls::error("duplicate Vulkan device handle");
+            layerDeviceInserted = true;
+            if (const auto engine = instance_info->instanceEngineNames.find(
+                    dispatchKey(physdev));
+                    engine != instance_info->instanceEngineNames.end()) {
+                instance_info->deviceEngineNames.insert_or_assign(
+                    *device, engine->second);
+            }
+
+            // Queue handles are stable for the device lifetime. Register
+            // every ordinary queue the application requested so scaling can
+            // submit only on the exact externally-synchronized presentation
+            // queue and only with a compatible command-pool family.
+            for (uint32_t i = 0; i < info->queueCreateInfoCount; ++i) {
+                const auto& requested = info->pQueueCreateInfos[i];
+                if (requested.flags != 0) {
+                    continue;
+                }
+                for (uint32_t queueIndex = 0;
+                        queueIndex < requested.queueCount; ++queueIndex) {
+                    VkQueue queue{VK_NULL_HANDLE};
+                    wrapper->second.df().GetDeviceQueue(
+                        *device, requested.queueFamilyIndex,
+                        queueIndex, &queue
+                    );
+                    if (queue == VK_NULL_HANDLE)
+                        continue;
+                    if (queue != wrapper->second.queue() &&
+                            wrapper->second.loaderdatafunc()) {
+                        const auto loaderResult =
+                            (*wrapper->second.loaderdatafunc())(*device, queue);
+                        if (loaderResult != VK_SUCCESS) {
+                            throw ls::vulkan_error(
+                                loaderResult,
+                                "vkSetDeviceLoaderData() failed for application queue"
+                            );
+                        }
+                    }
+                    instance_info->queueIdentities.insert_or_assign(
+                        queue,
+                        InstanceInfo::QueueIdentity{
+                            .device = *device,
+                            .familyIndex = requested.queueFamilyIndex,
+                        }
+                    );
+                }
+            }
+        } catch (const std::exception& e) {
+            // Destroy layer-owned command pools/cache while the valid lower
+            // VkDevice still exists; only then may rollback destroy the device
+            // or native fallback expose it without a stale wrapper.
+            discardLayerDevice();
+            if (scalingEngineProvisioned) {
+                rollbackCreatedDevice();
+                std::cerr << "MAKO Renderer: device initialization failed for "
+                             "a provisioned Scaling Engine profile; refusing "
+                             "native fallback after fixed-surface capability "
+                             "virtualization:\n"
+                          << "- " << e.what() << '\n';
+                return VK_ERROR_FEATURE_NOT_PRESENT;
+            }
+            // The lower layer already returned a valid VkDevice. Do not leave
+            // it exposed to MAKO's swapchain hooks without a matching Vulkan
+            // wrapper: retain the device as a completely native pass-through.
+            instance_info->nativeDevices.insert(*device);
+            std::cerr << "MAKO Renderer: device initialization failed; "
+                         "native Vulkan device retained:\n";
+            std::cerr << "- " << e.what() << '\n';
+        }
+
+        lowerDeviceCreated = false;
+
+        return VK_SUCCESS;
+    }
+
+    // destroy device
+    void myvkDestroyDevice(VkDevice device, const VkAllocationCallbacks* alloc) {
+        const std::lock_guard lifeLock(lifecycleMutex());
+        if (!instance_info)
+            return;
+
+        std::vector<std::unique_ptr<IndependentRealPresent>> doomedIndep;
+        {
+            const std::unique_lock regLock(registryMutex());
+            for (auto itSwap = instance_info->independentRealSwapchains.begin();
+                    itSwap != instance_info->independentRealSwapchains.end();) {
+                const auto found = instance_info->swapchains.find(itSwap->first);
+                if (found == instance_info->swapchains.end() || found->second.get().dev() != device) {
+                    ++itSwap;
+                    continue;
+                }
+                instance_info->swapchains.erase(found);
+                doomedIndep.push_back(std::move(itSwap->second));
+                itSwap = instance_info->independentRealSwapchains.erase(itSwap);
+            }
+        }
+        doomedIndep.clear();
+
+        collectRetiredSwapchains(
+            device, 250'000'000, "device-destroy"
+        );
+        forceFinalizeRetiredSwapchains(device);
+
+        PFN_vkDestroyDevice vkDestroyDevice = nullptr;
+        {
+            const std::unique_lock regLock(registryMutex());
+            PFN_vkGetDeviceProcAddr nextGpa = instance_info->funcs.GetDeviceProcAddr;
+            if (const auto gIt = instance_info->devNextGpa.find(device); gIt != instance_info->devNextGpa.end() && gIt->second)
+                nextGpa = gIt->second;
+            if (nextGpa)
+                vkDestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(nextGpa(device, "vkDestroyDevice"));
+            instance_info->devNextGpa.erase(device);
+            auto it = instance_info->devices.find(device);
+            if (it != instance_info->devices.end())
+                instance_info->devices.erase(it);
+            std::erase_if(
+                instance_info->queueIdentities,
+                [device](const auto& entry) {
+                    return entry.second.device == device;
+                }
+            );
+            instance_info->nativeDevices.erase(device);
+            instance_info->deviceEngineNames.erase(device);
+            instance_info->presentRetirementDevices.erase(device);
+            instance_info->gamescopeTimingDevices.erase(device);
+            instance_info->presentTimingDevices.erase(device);
+            instance_info->hdrMetadataDevices.erase(device);
+            instance_info->lowerHdrMetadataDevices.erase(device);
+        }
+        if (!vkDestroyDevice) {
+            std::cerr << "MAKO Renderer: failed to get next layer's vkDestroyDevice, "
+                "the previous layer does not follow spec\n";
+            return;
+        }
+
+        vkDestroyDevice(device, alloc);
+    }
+
+    // destroy instance
+    void myvkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* alloc) {
+        const std::lock_guard lifeLock(lifecycleMutex());
+        if (!instance_info || !layer_info)
+            return;
+        // remove instance handle
+        bool lastInstance = false;
+        PFN_vkGetInstanceProcAddr destroyInstGpa = layer_info->GetInstanceProcAddr;
+        {
+            const std::unique_lock regLock(registryMutex());
+            if (const auto gIt = instance_info->instNextGpa.find(instance); gIt != instance_info->instNextGpa.end() && gIt->second)
+                destroyInstGpa = gIt->second;
+            auto it = std::ranges::find(instance_info->handles, instance);
+            if (it != instance_info->handles.end())
+                instance_info->handles.erase(it);
+            instance_info->instNextGpa.erase(instance);
+            instance_info->instFuncsMap.erase(instance);
+            instance_info->lowerInstanceCommands.erase(instance);
+            instance_info->privateDeviceCallbacks.erase(instance);
+            if (instance)
+                instance_info->instanceEngineNames.erase(dispatchKey(instance));
+            lastInstance = instance_info->handles.empty();
+            if (!lastInstance) {
+                const VkInstance liveInst = instance_info->handles.front();
+                if (const auto fIt = instance_info->instFuncsMap.find(liveInst); fIt != instance_info->instFuncsMap.end()) {
+                    const auto prevDevGpa = instance_info->funcs.GetDeviceProcAddr;
+                    instance_info->funcs = fIt->second;
+                    if (!instance_info->funcs.GetDeviceProcAddr)
+                        instance_info->funcs.GetDeviceProcAddr = prevDevGpa;
+                }
+                if (const auto gIt = instance_info->instNextGpa.find(liveInst); gIt != instance_info->instNextGpa.end() && gIt->second)
+                    layer_info->GetInstanceProcAddr = gIt->second;
+            }
+        }
+
+        // destroy instance
+        auto vkDestroyInstance = destroyInstGpa
+            ? reinterpret_cast<PFN_vkDestroyInstance>(destroyInstGpa(instance, "vkDestroyInstance"))
+            : nullptr;
+        if (!vkDestroyInstance) {
+            std::cerr << "MAKO Renderer: failed to get next layer's vkDestroyInstance, "
+                "the previous layer does not follow spec\n";
+
+            if (lastInstance) {
+                delete instance_info; // NOLINT (memory management)
+                instance_info = nullptr;
+                delete layer_info; // NOLINT (memory management)
+                layer_info = nullptr;
+            }
+            return;
+        }
+
+        vkDestroyInstance(instance, alloc);
+
+        // The Vulkan loader may unload this shared object as soon as the final
+        // vkDestroyInstance() wrapper returns. Root owns a Gamescope feedback
+        // monitor thread, so leaving the process-global LayerInfo allocated
+        // lets that worker resume inside unmapped layer code after dlclose().
+        // Destroy all layer-owned state, including joining the monitor, while
+        // our code is still resident. A later loader negotiation can recreate
+        // the state if the application opens another Vulkan instance.
+        if (lastInstance) {
+            const std::unique_lock regLock(registryMutex());
+            delete instance_info; // NOLINT (memory management)
+            instance_info = nullptr;
+            delete layer_info; // NOLINT (memory management)
+            layer_info = nullptr;
+        }
+    }
+
+    bool isPresentWaitCommand(const std::string_view name) {
+        return name == "vkWaitForPresentKHR"
+#if defined(VK_KHR_present_wait2)
+            || name == "vkWaitForPresent2KHR"
+#endif
+            ;
+    }
+
+    bool isOptionalPresentationCommand(const std::string_view name) {
+        return name == "vkAcquireNextImage2KHR" || isPresentWaitCommand(name);
+    }
+
+    // Instrument only an application-invoked wait. Do not invent completion,
+    // shorten timeouts, reinterpret present IDs, or take a swapchain-owner lock
+    // across the driver's blocking call. GPA gates retain optional support.
+    VkResult VKAPI_CALL myvkWaitForPresentKHR(VkDevice device,
+            VkSwapchainKHR swapchain, uint64_t presentId, uint64_t timeout) {
+        if (const auto independent = instance_info->independentRealSwapchains.find(swapchain);
+                independent != instance_info->independentRealSwapchains.end())
+            return independent->second->waitForPresent(presentId, timeout);
+        const auto next = reinterpret_cast<PFN_vkWaitForPresentKHR>(
+            instance_info->funcs.GetDeviceProcAddr(device, "vkWaitForPresentKHR"));
+        return present_diagnostics::observeApplicationPresentWait(device, swapchain,
+            present_diagnostics::PresentWaitApi::Khr, presentId, timeout,
+            [&] { return next(device, swapchain, presentId, timeout); });
+    }
+
+#if defined(VK_KHR_present_wait2)
+    VkResult VKAPI_CALL myvkWaitForPresent2KHR(VkDevice device,
+            VkSwapchainKHR swapchain, const VkPresentWait2InfoKHR* info) {
+        const auto next = reinterpret_cast<PFN_vkWaitForPresent2KHR>(
+            instance_info->funcs.GetDeviceProcAddr(device, "vkWaitForPresent2KHR"));
+        return present_diagnostics::observeApplicationPresentWait(device, swapchain,
+            present_diagnostics::PresentWaitApi::Khr2, info->presentId, info->timeout,
+            [&] { return next(device, swapchain, info); });
+    }
+#endif
+
+    // get optional function pointer override
+    void VKAPI_CALL myvkSetHdrMetadataEXT(VkDevice device, uint32_t count,
+            const VkSwapchainKHR* swapchains, const VkHdrMetadataEXT* metadata) {
+        const auto lower = reinterpret_cast<PFN_vkSetHdrMetadataEXT>(
+            instance_info->funcs.GetDeviceProcAddr(device, "vkSetHdrMetadataEXT"));
+        if (!instance_info->hdrMetadataDevices.contains(device)) {
+            if (lower)
+                lower(device, count, swapchains, metadata);
+            return;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto found = instance_info->swapchainInfos.find(swapchains[i]);
+            if (found != instance_info->swapchainInfos.end() &&
+                    instance_info->scalingSurfaces->setHdrMetadata(
+                        found->second.surface, swapchains[i], metadata[i]))
+                continue;
+            if (lower && instance_info->lowerHdrMetadataDevices.contains(device))
+                lower(device, 1, swapchains + i, metadata + i);
+        }
+    }
+
+    PFN_vkVoidFunction getProcAddr(const std::string& name) {
+        if (name == "vkSetHdrMetadataEXT" && !bridgeHdrEnabled())
+            return nullptr;
+        // Only the application-facing role observes this call. A lower
+        // spatial role must not count the same forwarded wait a second time.
+        if (isPresentWaitCommand(name) && (!frameGenerationLayer ||
+                (!present_diagnostics::enabled() && !(name == "vkWaitForPresentKHR" && independentRealRequested()))))
+            return nullptr;
+        auto it = layer_info->map.find(name);
+        if (it == layer_info->map.end()) return nullptr;
+
+        if (layer_info->root.active()) return it->second;
+
+        // A dormant layer still owns its instance/device lifecycle wrappers,
+        // which establish the next-layer pointers and release process state.
+        // Swapchain and present entrypoints must bypass MAKO completely because
+        // an unmatched application did not enable MAKO's required extensions.
+        if (name == "vkCreateInstance" || name == "vkDestroyInstance"
+                || name == "vkCreateDevice" || name == "vkDestroyDevice")
+            return it->second;
+
+        return nullptr;
+    }
+
+    // get instance-level function pointers
+    PFN_vkVoidFunction myvkGetDeviceProcAddr(VkDevice device, const char* name);
+
+    PFN_vkVoidFunction myvkGetInstanceProcAddr(VkInstance instance, const char* name) {
+        if (!name) return nullptr;
+        // A loader may cache the negotiated GPA function across multiple
+        // VkInstance lifetimes without negotiating again. The final instance
+        // teardown destroys Root so its monitor thread is joined before a
+        // possible dlclose; recreate that process state on the next GPA query.
+        if (!layer_info) {
+            const std::lock_guard lifeLock(lifecycleMutex());
+            if (!layer_info && !initializeLayerInfo()) return nullptr;
+        }
+
+        // A layer above resolves the commands it does not intercept through
+        // the lookups returned here, so they must be this layer's own.
+        if (std::string_view(name) == "vkGetInstanceProcAddr")
+            return reinterpret_cast<PFN_vkVoidFunction>(myvkGetInstanceProcAddr);
+        if (std::string_view(name) == "vkGetDeviceProcAddr")
+            return reinterpret_cast<PFN_vkVoidFunction>(myvkGetDeviceProcAddr);
+
+        if (std::string_view(name) ==
+                "vkGetPhysicalDeviceSurfaceCapabilities2KHR" ||
+                std::string_view(name) ==
+                "vkGetPhysicalDeviceSurfaceFormats2KHR" ||
+                std::string_view(name) == "vkGetPhysicalDeviceFeatures2" ||
+                std::string_view(name) == "vkGetPhysicalDeviceFeatures2KHR" ||
+                isOptionalPresentationCommand(name)) {
+            if (!instance || !layer_info->GetInstanceProcAddr ||
+                    !lowerInstanceProcAddr(instance, name)) {
+                return nullptr;
+            }
+        }
+
+        auto func = getProcAddr(name);
+        if (func) return func;
+
+        PFN_vkGetInstanceProcAddr nextInstGpa = nullptr;
+        {
+            const std::shared_lock regLock(registryMutex());
+            if (instance && instance_info) {
+                const auto gIt = instance_info->instNextGpa.find(instance);
+                if (gIt != instance_info->instNextGpa.end())
+                    nextInstGpa = gIt->second;
+            }
+            if (!nextInstGpa && layer_info)
+                nextInstGpa = layer_info->GetInstanceProcAddr;
+        }
+        return nextInstGpa ? nextInstGpa(instance, name) : nullptr;
+    }
+
+    // get device-level function pointers
+    PFN_vkVoidFunction myvkGetDeviceProcAddr(VkDevice device, const char* name) {
+        if (!name) return nullptr;
+        // Steam's Fossilize layer, for example, asks for this lookup and then
+        // resolves every command it does not intercept, swapchain creation
+        // included, through it. The next layer's lookup would skip MAKO.
+        if (std::string_view(name) == "vkGetDeviceProcAddr")
+            return reinterpret_cast<PFN_vkVoidFunction>(myvkGetDeviceProcAddr);
+        PFN_vkGetDeviceProcAddr nextGpa = nullptr;
+        bool hdrDev = false;
+        bool nativeDev = false;
+        {
+            const std::shared_lock regLock(registryMutex());
+            if (!layer_info || !instance_info)
+                return nullptr;
+            if (device) {
+                const auto dIt = instance_info->devNextGpa.find(device);
+                if (dIt != instance_info->devNextGpa.end())
+                    nextGpa = dIt->second;
+            }
+            if (!nextGpa)
+                nextGpa = instance_info->funcs.GetDeviceProcAddr;
+            if (!nextGpa)
+                return nullptr;
+            hdrDev = instance_info->hdrMetadataDevices.contains(device);
+            nativeDev = instance_info->nativeDevices.contains(device);
+        }
+
+        if (isOptionalPresentationCommand(name) && !nextGpa(device, name))
+            return nullptr;
+
+        if (std::string_view(name) == "vkSetHdrMetadataEXT" && !hdrDev)
+            return nextGpa(device, name);
+
+        if (nativeDev) {
+            if (std::string_view(name) == "vkDestroyDevice")
+                return reinterpret_cast<PFN_vkVoidFunction>(myvkDestroyDevice);
+            return nextGpa(device, name);
+        }
+
+        auto func = getProcAddr(name);
+        if (func) return func;
+
+        return nextGpa(device, name);
+    }
+}
+
+#if defined(MAKO_LAYER_ROLE_SPATIAL_SCALING)
+// The split roles are separate DSOs, and Gamescope WSI may replace the surface
+// handle between them. Export only a same-thread, one-shot capability relay
+// from the lower spatial role. The upper role brackets one downstream query;
+// current split layout 2 uses the immutable result to own the combined
+// scaler/frame-generation context without moving the lower capability owner.
+extern "C" __attribute__((visibility("default"))) VkBool32
+makoSpatialScalingLookupFixedContract(
+        const uint32_t rawOperation,
+        const VkPhysicalDevice physicalDevice,
+        VkSurfaceKHR* const lowerSurface,
+        VkExtent2D* const source,
+        VkExtent2D* const presentation,
+        float* const factor,
+        uint64_t* const policyRevision,
+        uint64_t* const queryGeneration,
+        VkBool32* const spatialSurfaceScalingSupported,
+        VkBool32* const variableSurface,
+        VkBool32* const memoryBudgetConstrained,
+        uint32_t* const inactiveReason) noexcept {
+    const auto operation = static_cast<FixedSurfaceCapabilityRelayOperation>(
+        rawOperation
+    );
+    FixedSurfaceCapabilityRelaySlot* slot{};
+    if (operation ==
+            FixedSurfaceCapabilityRelayOperation::BeginCapability ||
+            operation ==
+            FixedSurfaceCapabilityRelayOperation::ConsumeCapability) {
+        slot = &fixedSurfaceCapabilityRelay;
+    } else if (operation ==
+            FixedSurfaceCapabilityRelayOperation::BeginCreate ||
+            operation == FixedSurfaceCapabilityRelayOperation::ConsumeCreate) {
+        slot = &spatialCreateRelay;
+    }
+    if (!slot)
+        return VK_FALSE;
+
+    if (operation == FixedSurfaceCapabilityRelayOperation::BeginCapability ||
+            operation == FixedSurfaceCapabilityRelayOperation::BeginCreate) {
+        slot->begin();
+        return VK_TRUE;
+    }
+    if (!lowerSurface || !source || !presentation || !factor ||
+            !policyRevision || !queryGeneration ||
+            !spatialSurfaceScalingSupported || !variableSurface ||
+            !memoryBudgetConstrained || !inactiveReason) {
+        slot->begin();
+        return VK_FALSE;
+    }
+
+    const auto record = slot->consume(physicalDevice);
+    if (!record)
+        return VK_FALSE;
+
+    *lowerSurface = record->lowerSurface;
+    *source = record->contract.extents.source;
+    *presentation = record->contract.extents.presentation;
+    *factor = record->contract.factor;
+    *policyRevision = record->contract.policyRevision;
+    *queryGeneration = record->contract.queryGeneration;
+    const auto metadata = fixedSurfaceScalingContractRelayMetadata(
+        record->contract
+    );
+    *spatialSurfaceScalingSupported =
+        metadata.spatialSurfaceScalingSupported;
+    *variableSurface = metadata.variableSurface;
+    *memoryBudgetConstrained = metadata.memoryBudgetConstrained;
+    *inactiveReason = metadata.inactiveReason;
+    return VK_TRUE;
+}
+#endif
+
+namespace {
+    using LowerFixedSurfaceContractLookup = VkBool32 (*) (
+        uint32_t, VkPhysicalDevice, VkSurfaceKHR*, VkExtent2D*, VkExtent2D*,
+        float*, uint64_t*, uint64_t*, VkBool32*, VkBool32*, VkBool32*,
+        uint32_t*
+    );
+
+    constexpr std::string_view lowerFixedSurfaceContractSymbol =
+        "makoSpatialScalingLookupFixedContract";
+    constexpr std::string_view lowerSpatialLayerLibrary =
+        "libmako-render-scaling.so";
+
+    struct LowerFixedSurfaceContractLookupState {
+        void* handle{nullptr};
+        LowerFixedSurfaceContractLookup lookup{nullptr};
+        VkPhysicalDevice physicalDevice{VK_NULL_HANDLE};
+        FixedSurfaceCapabilityRelayOperation beginOperation{
+            FixedSurfaceCapabilityRelayOperation::BeginCapability
+        };
+        FixedSurfaceCapabilityRelayOperation consumeOperation{
+            FixedSurfaceCapabilityRelayOperation::ConsumeCapability
+        };
+        bool armed{false};
+
+        LowerFixedSurfaceContractLookupState() = default;
+        LowerFixedSurfaceContractLookupState(
+                const FixedSurfaceCapabilityRelayOperation beginOperation,
+                const FixedSurfaceCapabilityRelayOperation consumeOperation) :
+            beginOperation(beginOperation), consumeOperation(consumeOperation) {}
+        LowerFixedSurfaceContractLookupState(
+            const LowerFixedSurfaceContractLookupState&
+        ) = delete;
+        LowerFixedSurfaceContractLookupState& operator=(
+            const LowerFixedSurfaceContractLookupState&
+        ) = delete;
+
+        ~LowerFixedSurfaceContractLookupState() {
+            reset();
+            if (handle)
+                dlclose(handle);
+        }
+
+        void reset() noexcept {
+            if (armed && lookup) {
+                static_cast<void>(lookup(
+                    static_cast<uint32_t>(
+                        this->beginOperation
+                    ),
+                    physicalDevice, nullptr, nullptr, nullptr, nullptr,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr
+                ));
+            }
+            armed = false;
+        }
+
+        void begin(const VkPhysicalDevice requestedPhysicalDevice) noexcept {
+            physicalDevice = requestedPhysicalDevice;
+            if (!lookup)
+                return;
+            armed = lookup(
+                static_cast<uint32_t>(
+                    this->beginOperation
+                ),
+                physicalDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
+                nullptr, nullptr, nullptr, nullptr, nullptr
+            ) == VK_TRUE;
+        }
+
+        [[nodiscard]] std::optional<FixedSurfaceCapabilityRelayRecord>
+        consume() noexcept {
+            if (!armed || !lookup)
+                return std::nullopt;
+
+            FixedSurfaceCapabilityRelayRecord record{
+                .physicalDevice = physicalDevice,
+            };
+            FixedSurfaceScalingContractRelayMetadata metadata;
+            const VkBool32 found = lookup(
+                static_cast<uint32_t>(
+                    this->consumeOperation
+                ),
+                physicalDevice, &record.lowerSurface,
+                &record.contract.extents.source,
+                &record.contract.extents.presentation,
+                &record.contract.factor, &record.contract.policyRevision,
+                &record.contract.queryGeneration,
+                &metadata.spatialSurfaceScalingSupported,
+                &metadata.variableSurface, &metadata.memoryBudgetConstrained,
+                &metadata.inactiveReason
+            );
+            armed = false;
+            if (found != VK_TRUE ||
+                    !applyFixedSurfaceScalingContractRelayMetadata(
+                        record.contract, metadata
+                    )) {
+                return std::nullopt;
+            }
+            return record;
+        }
+    };
+
+    int findLowerFixedSurfaceContractLookup(
+            struct dl_phdr_info* const info, const size_t,
+            void* const rawState) {
+        auto& state = *static_cast<LowerFixedSurfaceContractLookupState*>(
+            rawState
+        );
+        const std::string_view libraryPath(
+            info && info->dlpi_name ? info->dlpi_name : ""
+        );
+        if (!libraryPath.ends_with(lowerSpatialLayerLibrary))
+            return 0;
+
+        void* const handle = dlopen(
+            libraryPath.data(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD
+        );
+        if (!handle)
+            return 0;
+        const auto lookup = reinterpret_cast<LowerFixedSurfaceContractLookup>(
+            dlsym(handle, lowerFixedSurfaceContractSymbol.data())
+        );
+        if (!lookup) {
+            dlclose(handle);
+            return 0;
+        }
+        state.handle = handle;
+        state.lookup = lookup;
+        return 1;
+    }
+
+    void beginLowerFixedSurfaceCapabilityRelay(
+            LowerFixedSurfaceContractLookupState& state,
+            const VkPhysicalDevice physicalDevice) {
+        if (!spatialScalingCapabilityRelayByLayer())
+            return;
+
+        dl_iterate_phdr(findLowerFixedSurfaceContractLookup, &state);
+        if (!state.lookup)
+            return;
+        state.begin(physicalDevice);
+    }
+
+    struct SurfaceScalingEligibilityResult {
+        bool supported{false};
+        bool firstObservation{false};
+        bool queueSupported{false};
+        uint32_t advertisedFormatCount{0};
+        uint32_t compatibleFormatCount{0};
+    };
+
+    SurfaceScalingEligibilityResult supportsSpatialScalingSurface(
+            const VkPhysicalDevice physicalDevice,
+            const VkSurfaceKHR surface,
+            const VkSurfaceCapabilitiesKHR& capabilities) {
+        if (!spatialScalingSurfaceCapabilitiesSupported(capabilities)) {
+            return {};
+        }
+        {
+            const std::lock_guard lock(
+                instance_info->surfaceScalingMutex
+            );
+            const auto physical =
+                instance_info->surfaceScalingEligibility.find(physicalDevice);
+            if (physical !=
+                    instance_info->surfaceScalingEligibility.end()) {
+                const auto cached = physical->second.find(surface);
+                if (cached != physical->second.end()) {
+                    return {
+                        .supported = cached->second.supported,
+                        .firstObservation = false,
+                        .queueSupported = cached->second.queueSupported,
+                        .advertisedFormatCount =
+                            cached->second.advertisedFormatCount,
+                        .compatibleFormatCount =
+                            cached->second.compatibleFormatCount,
+                    };
+                }
+            }
+        }
+
+        bool supported = true;
+
+        bool queueSupported = false;
+        if (supported &&
+                instance_info->funcs.GetPhysicalDeviceSurfaceSupportKHR) {
+            uint32_t familyCount{};
+            instance_info->funcs.GetPhysicalDeviceQueueFamilyProperties(
+                physicalDevice, &familyCount, nullptr
+            );
+            std::vector<VkQueueFamilyProperties> families(familyCount);
+            instance_info->funcs.GetPhysicalDeviceQueueFamilyProperties(
+                physicalDevice, &familyCount, families.data()
+            );
+            constexpr VkQueueFlags required =
+                VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+            for (uint32_t family = 0; family < familyCount; ++family) {
+                if ((families.at(family).queueFlags & required) != required)
+                    continue;
+                VkBool32 presentationSupported = VK_FALSE;
+                const auto result =
+                    instance_info->funcs.GetPhysicalDeviceSurfaceSupportKHR(
+                        physicalDevice, family, surface,
+                        &presentationSupported
+                    );
+                if (result == VK_SUCCESS &&
+                        presentationSupported == VK_TRUE) {
+                    queueSupported = true;
+                    break;
+                }
+            }
+        }
+        supported = supported && queueSupported;
+
+        constexpr VkFormatFeatureFlags scalerFeatures =
+            VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+            VK_FORMAT_FEATURE_BLIT_DST_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+            VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+        uint32_t formatCount{};
+        std::vector<VkSurfaceFormatKHR> formats;
+        if (supported) {
+            bool complete = false;
+            constexpr uint32_t maximumEnumerationAttempts = 3;
+            for (uint32_t attempt = 0;
+                    attempt < maximumEnumerationAttempts && !complete;
+                    ++attempt) {
+                auto result =
+                    instance_info->funcs.GetPhysicalDeviceSurfaceFormatsKHR(
+                        physicalDevice, surface, &formatCount, nullptr
+                    );
+                if (result != VK_SUCCESS || formatCount == 0)
+                    return {};
+                formats.resize(formatCount);
+                uint32_t writtenCount = formatCount;
+                result =
+                    instance_info->funcs.GetPhysicalDeviceSurfaceFormatsKHR(
+                        physicalDevice, surface, &writtenCount,
+                        formats.data()
+                    );
+                if (result == VK_SUCCESS) {
+                    if (writtenCount == 0)
+                        return {};
+                    formats.resize(writtenCount);
+                    formatCount = writtenCount;
+                    complete = true;
+                } else if (result != VK_INCOMPLETE) {
+                    return {};
+                }
+            }
+            // A partial prefix cannot prove that every advertised format is
+            // safe. Leave transient INCOMPLETE results uncached so a later
+            // stable query can retry the eligibility decision.
+            if (!complete)
+                return {};
+        }
+
+        constexpr VkFormatFeatureFlags swapchainFeatures =
+            VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+            VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        uint32_t compatibleFormatCount = 0;
+        if (supported) {
+            compatibleFormatCount = static_cast<uint32_t>(
+                std::ranges::count_if(
+                    formats.begin(), formats.begin() + formatCount,
+                    [&](const VkSurfaceFormatKHR& format) {
+                    if (format.format == VK_FORMAT_UNDEFINED)
+                        return false;
+                    const auto pipeline = classifySwapchainColor(
+                        format.format, format.colorSpace, false
+                    );
+                    if (!spatialScalingColorSupported(pipeline)) {
+                        return false;
+                    }
+
+                    VkFormatProperties surfaceProperties{};
+                    instance_info->funcs.GetPhysicalDeviceFormatProperties(
+                        physicalDevice, format.format, &surfaceProperties
+                    );
+                    if ((surfaceProperties.optimalTilingFeatures &
+                            swapchainFeatures) != swapchainFeatures) {
+                        return false;
+                    }
+
+                    VkFormatProperties workingProperties{};
+                    instance_info->funcs.GetPhysicalDeviceFormatProperties(
+                        physicalDevice, pipeline.exchangeFormat,
+                        &workingProperties
+                    );
+                    return (workingProperties.optimalTilingFeatures &
+                        scalerFeatures) == scalerFeatures;
+                    }
+                )
+            );
+        }
+        supported = spatialScalingFixedSurfacePreflightSupported(
+            queueSupported, formatCount, compatibleFormatCount
+        );
+
+        bool firstObservation = false;
+        {
+            const std::lock_guard lock(
+                instance_info->surfaceScalingMutex
+            );
+            auto& surfaces =
+                instance_info->surfaceScalingEligibility[physicalDevice];
+            const auto [cached, inserted] = surfaces.emplace(
+                surface,
+                InstanceInfo::SurfaceScalingEligibility{
+                    .supported = supported,
+                    .queueSupported = queueSupported,
+                    .advertisedFormatCount = formatCount,
+                    .compatibleFormatCount = compatibleFormatCount,
+                }
+            );
+            supported = cached->second.supported;
+            queueSupported = cached->second.queueSupported;
+            formatCount = cached->second.advertisedFormatCount;
+            compatibleFormatCount = cached->second.compatibleFormatCount;
+            firstObservation = inserted;
+        }
+        return {
+            .supported = supported,
+            .firstObservation = firstObservation,
+            .queueSupported = queueSupported,
+            .advertisedFormatCount = formatCount,
+            .compatibleFormatCount = compatibleFormatCount,
+        };
+    }
+
+    void clearFixedSurfaceScalingContract(
+            const VkPhysicalDevice physicalDevice,
+            const VkSurfaceKHR surface) {
+        if (!instance_info)
+            return;
+
+        const std::lock_guard lock(instance_info->surfaceScalingMutex);
+        const auto physicalContracts =
+            instance_info->fixedSurfaceScalingContracts.find(physicalDevice);
+        if (physicalContracts !=
+                instance_info->fixedSurfaceScalingContracts.end()) {
+            physicalContracts->second.erase(surface);
+            if (physicalContracts->second.empty()) {
+                instance_info->fixedSurfaceScalingContracts.erase(
+                    physicalContracts
+                );
+            }
+        }
+    }
+
+    void recordSurfaceOrigin(
+            const VkSurfaceKHR surface,
+            const SpatialSurfaceOrigin origin) {
+        if (!instance_info || surface == VK_NULL_HANDLE)
+            return;
+        bool inserted{};
+        {
+            const std::lock_guard lock(instance_info->surfaceScalingMutex);
+            inserted = instance_info->surfaceOrigins.emplace(
+                surface, origin
+            ).second;
+        }
+        if (inserted && present_diagnostics::enabled()) {
+            std::cerr << "MAKO Renderer: present diagnostics: "
+                         "operation=surface-provenance"
+                      << " role=" << layerRoleName
+                      << " surface=" << surface
+                      << " origin=" << spatialSurfaceOriginName(origin)
+                      << " gamescope_wsi_surface_proven="
+                      << (origin == SpatialSurfaceOrigin::Wayland ? 1 : 0)
+                      << '\n';
+        }
+    }
+
+    [[nodiscard]] SpatialSurfaceOrigin surfaceOrigin(
+            const VkSurfaceKHR surface) {
+        if (!instance_info)
+            return SpatialSurfaceOrigin::Unknown;
+        const std::lock_guard lock(instance_info->surfaceScalingMutex);
+        const auto origin = instance_info->surfaceOrigins.find(surface);
+        return origin == instance_info->surfaceOrigins.end()
+            ? SpatialSurfaceOrigin::Unknown : origin->second;
+    }
+
+    void recordX11PresentationTarget(
+            const VkSurfaceKHR surface, const X11PresentationTarget target) {
+        if (!instance_info || surface == VK_NULL_HANDLE || !target.connection)
+            return;
+        const std::lock_guard lock(instance_info->surfaceScalingMutex);
+        instance_info->x11PresentationTargets.insert_or_assign(surface, target);
+    }
+
+    /// Wine can move a surface's window offscreen after creating the surface,
+    /// so read its nesting when each swapchain is created.
+    [[nodiscard]] std::optional<X11WindowNesting> offscreenX11Window(
+            const VkSurfaceKHR surface) {
+        if (!frameGenerationLayer || !instance_info)
+            return std::nullopt;
+        X11PresentationTarget target;
+        {
+            const std::lock_guard lock(instance_info->surfaceScalingMutex);
+            const auto found = instance_info->x11PresentationTargets.find(surface);
+            if (found == instance_info->x11PresentationTargets.end())
+                return std::nullopt;
+            target = found->second;
+        }
+        const auto nesting = queryX11WindowNesting(target);
+        if (!nesting || !x11WindowPresentsOffscreen(nesting->width,
+                nesting->height, nesting->topLevelWidth, nesting->topLevelHeight))
+            return std::nullopt;
+        return nesting;
+    }
+
+    [[nodiscard]] bool spatialSurfaceScalingSupported(
+            const VkSurfaceKHR surface) {
+        return spatialSplitSurfaceScalingSupported(
+            spatialScalingLayer, surfaceOrigin(surface)
+        );
+    }
+
+    void logUnprovenSplitSurfaceOnce(const VkSurfaceKHR surface) {
+        if (!instance_info || !spatialScalingLayer)
+            return;
+        bool firstObservation{};
+        const auto origin = surfaceOrigin(surface);
+        {
+            const std::lock_guard lock(instance_info->surfaceScalingMutex);
+            firstObservation = instance_info->unprovenSplitSurfacesLogged
+                .insert(surface).second;
+        }
+        if (firstObservation) {
+            std::cerr << "MAKO Renderer: spatial scaling split surface policy: "
+                      << "role=" << layerRoleName
+                      << "; surface=" << surface
+                      << "; origin=" << spatialSurfaceOriginName(origin)
+                      << "; gamescope_wsi_surface_proven=0"
+                      << "; action=native"
+                      << "; inactive_reason="
+                      << spatialScalingInactiveReasonName(
+                          SpatialScalingInactiveReason::
+                              GamescopeWsiSurfaceUnproven
+                      ) << '\n';
+        }
+    }
+
+    VkResult maybeVirtualizeSurfaceCapabilities(
+            const VkPhysicalDevice physicalDevice,
+            const VkSurfaceKHR surface,
+            VkSurfaceCapabilitiesKHR& capabilities,
+            const std::optional<FixedSurfaceCapabilityRelayRecord>&
+                lowerRelay) {
+        if (!layer_info || !instance_info) {
+            return VK_SUCCESS;
+        }
+        if (instance_info->scalingSurfaces) {
+            const auto result = instance_info->scalingSurfaces->applicationCapabilities(
+                surface, capabilities
+            );
+            if (result) {
+                // The application sees its X11 window size, while create-time
+                // policy queries the driver's real variable Wayland extent.
+                // This is not a fixed-surface source/presentation contract.
+                clearFixedSurfaceScalingContract(physicalDevice, surface);
+                return *result;
+            }
+        }
+        if (!spatialScalingCapabilityOwnedByLayer() &&
+                !spatialScalingCapabilityRelayByLayer()) {
+            clearFixedSurfaceScalingContract(physicalDevice, surface);
+            return VK_SUCCESS;
+        }
+        if (!spatialSurfaceScalingSupported(surface)) {
+            clearFixedSurfaceScalingContract(physicalDevice, surface);
+            logUnprovenSplitSurfaceOnce(surface);
+            return VK_SUCCESS;
+        }
+        try {
+            auto candidate = capabilities;
+            const auto relayInput = capabilities.currentExtent;
+            const FixedSurfaceScalingContract* const lowerContract =
+                lowerRelay ? &lowerRelay->contract : nullptr;
+            if (spatialScalingCapabilityRelayByLayer() &&
+                    (!lowerContract || !prepareFixedSurfaceCapabilityRelay(
+                        candidate, *lowerContract
+                    ))) {
+                clearFixedSurfaceScalingContract(physicalDevice, surface);
+                return VK_SUCCESS;
+            }
+            const auto selection =
+                layer_info->root.modifySurfaceCapabilities(candidate);
+            if (!selection) {
+                clearFixedSurfaceScalingContract(physicalDevice, surface);
+                return VK_SUCCESS;
+            }
+            if (lowerContract &&
+                    (!sameExtent(
+                        selection->extents.source,
+                        lowerContract->extents.source
+                    ) || !sameExtent(
+                        selection->extents.presentation,
+                        lowerContract->extents.presentation
+                    ) || selection->factor != lowerContract->factor)) {
+                clearFixedSurfaceScalingContract(physicalDevice, surface);
+                std::cerr << "MAKO Renderer: spatial scaling capability relay "
+                             "failed closed: reason=lower-contract-mismatch\n";
+                return VK_SUCCESS;
+            }
+            const auto eligibility = supportsSpatialScalingSurface(
+                physicalDevice, surface, capabilities
+            );
+            if (!eligibility.supported) {
+                clearFixedSurfaceScalingContract(physicalDevice, surface);
+                if (eligibility.firstObservation) {
+                    std::cerr << "MAKO Renderer: spatial scaling capability "
+                             "virtualization unavailable: reason="
+                          << (eligibility.queueSupported
+                                ? "no-compatible-sdr-format"
+                                : "no-presentation-capable-graphics-compute-queue")
+                          << "; queue_supported="
+                          << eligibility.queueSupported
+                          << "; advertised_formats="
+                          << eligibility.advertisedFormatCount
+                          << "; compatible_formats="
+                          << eligibility.compatibleFormatCount
+                          << '\n';
+                }
+                return VK_SUCCESS;
+            }
+            uint64_t queryGeneration{};
+            FixedSurfaceScalingContract publishedContract;
+            {
+                const std::lock_guard lock(
+                    instance_info->surfaceScalingMutex
+                );
+                queryGeneration =
+                    instance_info->nextSurfaceScalingQueryGeneration++;
+                publishedContract = FixedSurfaceScalingContract{
+                    .extents = selection->extents,
+                    .factor = selection->factor,
+                    .policyRevision = selection->policyRevision,
+                    .queryGeneration = queryGeneration,
+                };
+                instance_info->fixedSurfaceScalingContracts[physicalDevice]
+                    .insert_or_assign(surface, publishedContract);
+            }
+#if defined(MAKO_LAYER_ROLE_SPATIAL_SCALING)
+            fixedSurfaceCapabilityRelay.publish(
+                physicalDevice, surface, publishedContract
+            );
+#endif
+            if (eligibility.firstObservation) {
+                std::cerr << "MAKO Renderer: spatial scaling surface virtualized: "
+                          << "role=" << layerRoleName
+                          << "; source=" << candidate.currentExtent.width << 'x'
+                          << candidate.currentExtent.height
+                          << "; presentation="
+                          << selection->extents.presentation.width << 'x'
+                          << selection->extents.presentation.height
+                          << "; policy_revision="
+                          << selection->policyRevision
+                          << "; query_generation=" << queryGeneration
+                          << "; queue_supported="
+                          << eligibility.queueSupported
+                          << "; advertised_formats="
+                          << eligibility.advertisedFormatCount
+                          << "; compatible_formats="
+                          << eligibility.compatibleFormatCount;
+                if (lowerContract) {
+                    std::cerr << "; relay_input=" << relayInput.width << 'x'
+                              << relayInput.height
+                              << "; relay_mode="
+                              << (sameExtent(
+                                      relayInput,
+                                      lowerContract->extents.source
+                                  )
+                                      ? "source-normalized"
+                                      : "presentation-preserved")
+                              << "; relay_surface_mode="
+                              << (lowerRelay->lowerSurface == surface
+                                      ? "shared"
+                                      : "aliased");
+                }
+                std::cerr << '\n';
+            }
+            capabilities = candidate;
+        } catch (const std::exception& error) {
+            clearFixedSurfaceScalingContract(physicalDevice, surface);
+            std::cerr << "MAKO Renderer: spatial scaling capability policy "
+                         "failed closed: " << error.what() << '\n';
+        }
+        return VK_SUCCESS;
+    }
+
+    VkResult myvkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+            const VkPhysicalDevice physicalDevice,
+            const VkSurfaceKHR surface,
+            VkSurfaceCapabilitiesKHR* capabilities) {
+        const auto instFuncs = funcsForPhysicalDevice(physicalDevice);
+        if (!instance_info || !instFuncs.GetPhysicalDeviceSurfaceCapabilitiesKHR)
+            return VK_ERROR_INITIALIZATION_FAILED;
+        LowerFixedSurfaceContractLookupState lowerRelayState;
+        beginLowerFixedSurfaceCapabilityRelay(
+            lowerRelayState, physicalDevice
+        );
+        const auto result =
+            instFuncs.GetPhysicalDeviceSurfaceCapabilitiesKHR(
+                physicalDevice, surface, capabilities
+            );
+        const auto lowerRelay = lowerRelayState.consume();
+        if (result == VK_SUCCESS && capabilities) {
+            return maybeVirtualizeSurfaceCapabilities(
+                physicalDevice, surface, *capabilities, lowerRelay
+            );
+        } else {
+            clearFixedSurfaceScalingContract(physicalDevice, surface);
+        }
+        return result;
+    }
+
+    template <typename Format>
+    VkResult copyApplicationSurfaceFormats(
+            const std::vector<VkSurfaceFormatKHR>& formats,
+            uint32_t* count, Format* output) {
+        if (!count)
+            return VK_ERROR_INITIALIZATION_FAILED;
+        if (!output) {
+            *count = static_cast<uint32_t>(formats.size());
+            return VK_SUCCESS;
+        }
+        const uint32_t written = std::min(*count,
+            static_cast<uint32_t>(formats.size()));
+        for (uint32_t i = 0; i < written; ++i) {
+            if constexpr (std::is_same_v<Format, VkSurfaceFormatKHR>)
+                output[i] = formats[i];
+            else
+                output[i].surfaceFormat = formats[i];
+        }
+        *count = written;
+        return written < formats.size() ? VK_INCOMPLETE : VK_SUCCESS;
+    }
+
+    VkResult myvkGetPhysicalDeviceSurfaceFormatsKHR(
+            const VkPhysicalDevice physicalDevice, const VkSurfaceKHR surface,
+            uint32_t* count, VkSurfaceFormatKHR* formats) {
+        const auto instFuncs = funcsForPhysicalDevice(physicalDevice);
+        if (!instance_info || !instFuncs.GetPhysicalDeviceSurfaceFormatsKHR)
+            return VK_ERROR_INITIALIZATION_FAILED;
+        try {
+            if (instance_info->scalingSurfaces) {
+                const auto applicationFormats =
+                    instance_info->scalingSurfaces->applicationFormats(
+                        physicalDevice, surface,
+                        instFuncs.GetPhysicalDeviceSurfaceFormatsKHR);
+                if (applicationFormats)
+                    return copyApplicationSurfaceFormats(*applicationFormats,
+                        count, formats);
+            }
+        } catch (const std::bad_alloc&) {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        return instFuncs.GetPhysicalDeviceSurfaceFormatsKHR(
+            physicalDevice, surface, count, formats);
+    }
+
+    VkResult myvkGetPhysicalDeviceSurfaceFormats2KHR(
+            const VkPhysicalDevice physicalDevice,
+            const VkPhysicalDeviceSurfaceInfo2KHR* surfaceInfo,
+            uint32_t* count, VkSurfaceFormat2KHR* formats) {
+        if (!layer_info || !instance_info || !surfaceInfo || !count)
+            return VK_ERROR_INITIALIZATION_FAILED;
+        const VkInstance physInst = ownerInstanceForPhysicalDevice(physicalDevice);
+        const auto lower = physInst ? reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormats2KHR>(
+            lowerInstanceProcAddr(physInst,
+                "vkGetPhysicalDeviceSurfaceFormats2KHR")) : nullptr;
+        if (!lower)
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        bool plainFormats = !surfaceInfo->pNext;
+        if (formats) {
+            for (uint32_t i = 0; i < *count; ++i)
+                plainFormats = plainFormats && !formats[i].pNext;
+        }
+        try {
+            if (instance_info->scalingSurfaces) {
+                // Keep ordinary queries on their existing allocation/query
+                // path. Extended queries need their own lower constraints.
+                if (plainFormats) {
+                    const auto applicationFormats =
+                        instance_info->scalingSurfaces->applicationFormats(
+                            physicalDevice, surfaceInfo->surface,
+                            instance_info->funcs.GetPhysicalDeviceSurfaceFormatsKHR);
+                    if (applicationFormats)
+                        return copyApplicationSurfaceFormats(*applicationFormats, count, formats);
+                } else {
+                    const auto result = instance_info->scalingSurfaces->applicationFormats2(
+                        physicalDevice, *surfaceInfo, count, formats, lower);
+                    if (result)
+                        return *result;
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        return lower(physicalDevice, surfaceInfo, count, formats);
+    }
+
+    VkResult myvkGetPhysicalDeviceSurfaceCapabilities2KHR(
+            const VkPhysicalDevice physicalDevice,
+            const VkPhysicalDeviceSurfaceInfo2KHR* surfaceInfo,
+            VkSurfaceCapabilities2KHR* capabilities) {
+        if (!layer_info || !instance_info || !surfaceInfo || !capabilities)
+            return VK_ERROR_INITIALIZATION_FAILED;
+        const VkInstance physInst = ownerInstanceForPhysicalDevice(physicalDevice);
+        const auto lower = physInst ? reinterpret_cast<
+            PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR>(
+                lowerInstanceProcAddr(
+                    physInst,
+                    "vkGetPhysicalDeviceSurfaceCapabilities2KHR"
+                )
+            ) : nullptr;
+        if (!lower) {
+            clearFixedSurfaceScalingContract(
+                physicalDevice, surfaceInfo->surface
+            );
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+        LowerFixedSurfaceContractLookupState lowerRelayState;
+        beginLowerFixedSurfaceCapabilityRelay(
+            lowerRelayState, physicalDevice
+        );
+        const auto result = lower(physicalDevice, surfaceInfo, capabilities);
+        const auto lowerRelay = lowerRelayState.consume();
+        if (result == VK_SUCCESS) {
+            return maybeVirtualizeSurfaceCapabilities(
+                physicalDevice, surfaceInfo->surface,
+                capabilities->surfaceCapabilities, lowerRelay
+            );
+        } else {
+            clearFixedSurfaceScalingContract(
+                physicalDevice, surfaceInfo->surface
+            );
+        }
+        return result;
+    }
+
+    void myvkDestroySurfaceKHR(
+            const VkInstance instance, const VkSurfaceKHR surface,
+            const VkAllocationCallbacks* alloc) {
+        if (instance_info) {
+            // Destroying the application surface is an explicit terminal
+            // boundary: no replacement swapchain on this surface can follow.
+            // Drain the maintenance1 lifetime proof and release every deferred
+            // lower swapchain before forwarding the surface destruction.
+            collectRetiredSwapchainsForSurface(surface);
+            {
+                const std::lock_guard lock(
+                    instance_info->surfaceScalingMutex
+                );
+                for (auto& [physicalDevice, surfaces] :
+                        instance_info->surfaceScalingEligibility) {
+                    static_cast<void>(physicalDevice);
+                    surfaces.erase(surface);
+                }
+                for (auto& [physicalDevice, contracts] :
+                        instance_info->fixedSurfaceScalingContracts) {
+                    static_cast<void>(physicalDevice);
+                    contracts.erase(surface);
+                }
+                instance_info->variableSurfaceScalingExtents.erase(surface);
+                instance_info->variableSurfaceRollbackExtents.erase(surface);
+                instance_info->surfaceOrigins.erase(surface);
+                instance_info->x11PresentationTargets.erase(surface);
+                instance_info->independentRealRejectedSurfaces.erase(surface);
+                instance_info->unprovenSplitSurfacesLogged.erase(surface);
+                instance_info->scalingAdmissionRetryStates.erase(surface);
+            }
+        }
+        const auto lower = reinterpret_cast<PFN_vkDestroySurfaceKHR>(
+            lowerInstanceProcAddr(instance, "vkDestroySurfaceKHR")
+        );
+        if (lower)
+            lower(instance, surface, alloc);
+        if (instance_info && instance_info->scalingSurfaces)
+            instance_info->scalingSurfaces->destroy(surface);
+    }
+
+    using CreateWaylandSurface = VkResult (VKAPI_PTR *)(
+        VkInstance, const VkWaylandSurfaceCreateInfoKHR*,
+        const VkAllocationCallbacks*, VkSurfaceKHR*
+    );
+    using CreateXcbSurface = VkResult (VKAPI_PTR *)(
+        VkInstance, const VkXcbSurfaceCreateInfoKHR*,
+        const VkAllocationCallbacks*, VkSurfaceKHR*
+    );
+    using CreateXlibSurface = VkResult (VKAPI_PTR *)(
+        VkInstance, const VkXlibSurfaceCreateInfoKHR*,
+        const VkAllocationCallbacks*, VkSurfaceKHR*
+    );
+
+    template <typename CreateSurface, typename CreateInfo>
+    VkResult createSurfaceAndRecord(
+            const VkInstance instance,
+            const CreateInfo* createInfo,
+            const VkAllocationCallbacks* alloc,
+            VkSurfaceKHR* surface,
+            const char* entrypoint,
+            const SpatialSurfaceOrigin origin) {
+        const auto lower = reinterpret_cast<CreateSurface>(
+            lowerInstanceProcAddr(instance, entrypoint)
+        );
+        if (!lower)
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        const auto result = lower(instance, createInfo, alloc, surface);
+        if (result == VK_SUCCESS && surface)
+            recordSurfaceOrigin(*surface, origin);
+        return result;
+    }
+
+    VkResult myvkCreateWaylandSurfaceKHR(
+            const VkInstance instance,
+            const VkWaylandSurfaceCreateInfoKHR* createInfo,
+            const VkAllocationCallbacks* alloc,
+            VkSurfaceKHR* surface) {
+        return createSurfaceAndRecord<
+            CreateWaylandSurface
+        >(instance, createInfo, alloc, surface, "vkCreateWaylandSurfaceKHR",
+            SpatialSurfaceOrigin::Wayland);
+    }
+
+    VkResult myvkCreateXcbSurfaceKHR(
+            const VkInstance instance,
+            const VkXcbSurfaceCreateInfoKHR* createInfo,
+            const VkAllocationCallbacks* alloc,
+            VkSurfaceKHR* surface) {
+        if (instance_info && instance_info->scalingSurfaces && createInfo) {
+            try {
+                const auto result = instance_info->scalingSurfaces->create(
+                    instance, lowerInstanceProcAddr, *createInfo, alloc, surface);
+                if (result) {
+                    if (*result == VK_SUCCESS)
+                        recordSurfaceOrigin(*surface, SpatialSurfaceOrigin::Wayland);
+                    return *result;
+                }
+            } catch (const std::bad_alloc&) {
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+        }
+        const auto result = createSurfaceAndRecord<
+            CreateXcbSurface
+        >(instance, createInfo, alloc, surface, "vkCreateXcbSurfaceKHR",
+            SpatialSurfaceOrigin::Xcb);
+        if (result == VK_SUCCESS && surface && createInfo)
+            recordX11PresentationTarget(*surface, x11PresentationTarget(*createInfo));
+        return result;
+    }
+
+    VkResult myvkCreateXlibSurfaceKHR(
+            const VkInstance instance,
+            const VkXlibSurfaceCreateInfoKHR* createInfo,
+            const VkAllocationCallbacks* alloc,
+            VkSurfaceKHR* surface) {
+        if (instance_info && instance_info->scalingSurfaces && createInfo) {
+            try {
+                const auto result = instance_info->scalingSurfaces->create(
+                    instance, lowerInstanceProcAddr, *createInfo, alloc, surface);
+                if (result) {
+                    if (*result == VK_SUCCESS)
+                        recordSurfaceOrigin(*surface, SpatialSurfaceOrigin::Wayland);
+                    return *result;
+                }
+            } catch (const std::bad_alloc&) {
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+        }
+        const auto result = createSurfaceAndRecord<
+            CreateXlibSurface
+        >(instance, createInfo, alloc, surface, "vkCreateXlibSurfaceKHR",
+            SpatialSurfaceOrigin::Xlib);
+        if (result == VK_SUCCESS && surface && createInfo)
+            recordX11PresentationTarget(*surface, x11PresentationTarget(*createInfo));
+        return result;
+    }
+
+    VkResult myvkCreateSwapchainKHR(
+            VkDevice device,
+            const VkSwapchainCreateInfoKHR* info,
+            const VkAllocationCallbacks* alloc,
+            VkSwapchainKHR* swapchain) {
+        const std::lock_guard lifeLock(lifecycleMutex());
+        std::shared_lock initRegLock(registryMutex());
+        const auto& it = instance_info->devices.find(device);
+        if (it == instance_info->devices.end())
+            return VK_ERROR_INITIALIZATION_FAILED;
+        initRegLock.unlock();
+
+        const bool independentRequested = independentRealRequested();
+        const bool applicationOldSwapchainProvided = info->oldSwapchain != VK_NULL_HANDLE;
+        VkSwapchainCreateInfoKHR replacement{};
+        bool independentReplacementAllowed = false;
+        if (independentRequested) {
+            const std::lock_guard lock(instance_info->surfaceScalingMutex);
+            independentReplacementAllowed = !instance_info->independentRealRejectedSurfaces.contains(info->surface);
+        }
+        if (const auto old = instance_info->independentRealSwapchains.find(info->oldSwapchain);
+                old != instance_info->independentRealSwapchains.end()) {
+            independentReplacementAllowed &= old->second->active();
+            old->second->retireDisplay();
+            replacement = *info;
+            replacement.oldSwapchain = VK_NULL_HANDLE;
+            info = &replacement;
+        }
+        const auto* createExtension = static_cast<const VkBaseInStructure*>(info->pNext);
+        if (independentReplacementAllowed && !alloc && !info->oldSwapchain &&
+                (info->flags & ~VkSwapchainCreateFlagsKHR{VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR}) == 0 &&
+                info->imageColorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR && info->imageArrayLayers == 1 &&
+                info->imageSharingMode == VK_SHARING_MODE_EXCLUSIVE && it->second.frameGenerationInteropEnabled()) {
+            const VkInstance matchedInst = ownerInstanceForPhysicalDevice(it->second.physdev());
+            std::optional<X11PresentationTarget> matchedTarget;
+            {
+                const std::lock_guard surfLock(instance_info->surfaceScalingMutex);
+                if (const auto tIt = instance_info->x11PresentationTargets.find(info->surface);
+                        tIt != instance_info->x11PresentationTargets.end())
+                    matchedTarget = tIt->second;
+            }
+            if (matchedInst != VK_NULL_HANDLE && matchedTarget.has_value()) {
+                const auto callbacks = instance_info->privateDeviceCallbacks.find(matchedInst);
+                const auto devGpa = nextDeviceProcAddrFor(device);
+                const auto release = devGpa ? reinterpret_cast<PFN_vkReleaseSwapchainImagesKHR>(
+                    devGpa(device, "vkReleaseSwapchainImagesKHR")) : nullptr;
+                if (callbacks != instance_info->privateDeviceCallbacks.end() && callbacks->second.create &&
+                        callbacks->second.destroy && release && instance_info->presentRetirementDevices.contains(device)) {
+                    VkSwapchainKHR source{};
+                    try {
+                        auto context = std::make_unique<IndependentRealPresent>(it->second, matchedInst,
+                            callbacks->second, *matchedTarget, *info, release);
+                        source = context->applicationSwapchain();
+                        {
+                            const std::unique_lock regLock(registryMutex());
+                            instance_info->swapchains.emplace(source, ls::R<vk::Vulkan>(it->second));
+                            instance_info->independentRealSwapchains.emplace(source, std::move(context));
+                        }
+                        *swapchain = source;
+                        return VK_SUCCESS;
+                    } catch (const std::exception& error) {
+                        if (source) instance_info->swapchains.erase(source);
+                        std::clog << "MAKO Renderer: independent-real unavailable: " << error.what() << '\n';
+                    }
+                } else {
+                    std::clog << "MAKO Renderer: independent-real callbacks or source image release unavailable\n";
+                }
+            }
+        } else if (independentRequested) {
+            std::clog << "MAKO Renderer: independent-real swapchain not eligible"
+                      << " replacement_allowed=" << independentReplacementAllowed
+                      << " pnext=" << (createExtension ? static_cast<int>(createExtension->sType) : 0)
+                      << " flags=" << info->flags << " old=" << applicationOldSwapchainProvided << '\n';
+        }
+
+        if (independentRequested) {
+            // The hidden independent predecessor was retired above. All other
+            // create fields and native predecessor handles go straight to WSI.
+            const auto& vk = it->second;
+            VkSwapchainKHR nativeSwapchain{VK_NULL_HANDLE};
+            const auto result = vk.df().CreateSwapchainKHR(device, info, alloc, &nativeSwapchain);
+            if (result != VK_SUCCESS)
+                return result;
+            try {
+                // Only the regular Gamescope bridge path registers bridge content.
+                instance_info->swapchainInfos.emplace(nativeSwapchain, SwapchainInfo{
+                    .images = {},
+                    .surface = info->surface,
+                    .format = info->imageFormat,
+                    .colorSpace = info->imageColorSpace,
+                    .imageUsage = info->imageUsage,
+                    .requestedMinImageCount = info->minImageCount,
+                    .provisionedMinImageCount = info->minImageCount,
+                    .applicationOldSwapchainProvided = applicationOldSwapchainProvided,
+                    .applicationExtent = info->imageExtent,
+                    .extent = info->imageExtent,
+                    .incomingPresentMode = info->presentMode,
+                    .presentMode = info->presentMode,
+                    .frameGenerationSurfaceUnavailable = true,
+                    .spatialScalingActivationSupported = false,
+                    .replacement = applicationOldSwapchainProvided,
+                });
+                instance_info->swapchains.emplace(nativeSwapchain, ls::R<vk::Vulkan>(it->second));
+                instance_info->nativeSwapchains.insert(nativeSwapchain);
+            } catch (const std::bad_alloc&) {
+                instance_info->nativeSwapchains.erase(nativeSwapchain);
+                instance_info->swapchains.erase(nativeSwapchain);
+                instance_info->swapchainInfos.erase(nativeSwapchain);
+                vk.df().DestroySwapchainKHR(device, nativeSwapchain, alloc);
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+            *swapchain = nativeSwapchain;
+            std::clog << "MAKO Renderer: independent-real unavailable; native presentation retained\n";
+            return result;
+        }
+
+        VkSwapchainKHR createdSwapchain{VK_NULL_HANDLE};
+        bool lowerSwapchainCreated{false};
+        const auto rollbackCreatedSwapchain = [&]() noexcept {
+            if (!lowerSwapchainCreated || createdSwapchain == VK_NULL_HANDLE)
+                return;
+
+            instance_info->swapchains.erase(createdSwapchain);
+            instance_info->swapchainInfos.erase(createdSwapchain);
+            instance_info->nativeSwapchains.erase(createdSwapchain);
+            if (instance_info->scalingSurfaces) {
+                instance_info->scalingSurfaces->destroySwapchain(
+                    info->surface, createdSwapchain
+                );
+            }
+            try {
+                layer_info->root.removeSwapchainContext(createdSwapchain);
+            } catch (const std::exception& e) {
+                std::cerr << "MAKO Renderer: failed to retire a partially-created "
+                             "swapchain context: " << e.what() << '\n';
+            }
+            it->second.df().DestroySwapchainKHR(
+                device, createdSwapchain, alloc
+            );
+            *swapchain = VK_NULL_HANDLE;
+            lowerSwapchainCreated = false;
+        };
+
+        try {
+            // `oldSwapchain` is retired for new acquisition by the lower WSI,
+            // but images acquired before retirement may still be presented.
+            // Keep MAKO's old context and scaler resources alive until the
+            // application explicitly destroys that handle.
+
+            // A live factor change can make the upper role request recreation
+            // immediately after it observes a new profile. Force the lower
+            // role past the present-path polling interval here so both split
+            // layers build the replacement from the same saved revision.
+            layer_info->root.update(true);
+
+            if (present_diagnostics::enabled()) {
+                std::cerr << "MAKO Renderer: present diagnostics: "
+                             "operation=swapchain-create-observed"
+                          << " role=" << layerRoleName
+                          << " surface=" << info->surface
+                          << " requested_old_swapchain="
+                          << info->oldSwapchain
+                          << " requested_width=" << info->imageExtent.width
+                          << " requested_height=" << info->imageExtent.height
+                          << " requested_min_images=" << info->minImageCount
+                          << " requested_present_mode="
+                          << static_cast<int>(info->presentMode)
+                          << '\n';
+            }
+
+            // create swapchain
+            VkSwapchainCreateInfoKHR newInfo = *info;
+            bool ownedPresentTiming = false;
+            std::optional<SpatialScalingExtents> previousVariableExtents;
+            std::optional<SpatialScalingExtents>
+                variableSurfaceRollbackExtents;
+            std::optional<FixedSurfaceScalingContract> fixedSurfaceContract;
+            {
+                const std::lock_guard lock(
+                    instance_info->surfaceScalingMutex
+                );
+                const auto previous =
+                    instance_info->variableSurfaceScalingExtents.find(
+                        info->surface
+                    );
+                if (previous !=
+                        instance_info->variableSurfaceScalingExtents.end()) {
+                    previousVariableExtents = previous->second;
+                }
+                const auto rollback =
+                    instance_info->variableSurfaceRollbackExtents.find(
+                        info->surface
+                    );
+                if (rollback !=
+                        instance_info->variableSurfaceRollbackExtents.end()) {
+                    variableSurfaceRollbackExtents = rollback->second;
+                }
+                const auto physicalContracts =
+                    instance_info->fixedSurfaceScalingContracts.find(
+                        it->second.physdev()
+                    );
+                if (physicalContracts !=
+                        instance_info->fixedSurfaceScalingContracts.end()) {
+                    const auto contract = physicalContracts->second.find(
+                        info->surface
+                    );
+                    if (contract != physicalContracts->second.end())
+                        fixedSurfaceContract = contract->second;
+                }
+            }
+            // Fixed Gamescope surfaces do not participate in the variable-
+            // surface cache, but live factor changes can still recreate a
+            // swapchain before WSI changes the application's virtual window.
+            // Supply the exact previous split from the replaced swapchain so
+            // policy can retain it safely. For the null-old WSI spelling,
+            // accept a unique live context on this surface only.
+            const auto previousSwapchainExtents = [&]()
+                    -> std::optional<SpatialScalingExtents> {
+                const auto extentsFor = [&](const auto& swapchainInfo)
+                        -> std::optional<SpatialScalingExtents> {
+                    if (swapchainInfo.surface != info->surface || sameExtent(
+                            swapchainInfo.applicationExtent,
+                            swapchainInfo.extent
+                        )) {
+                        return std::nullopt;
+                    }
+                    return SpatialScalingExtents{
+                        .source = swapchainInfo.applicationExtent,
+                        .presentation = swapchainInfo.extent,
+                    };
+                };
+                if (info->oldSwapchain != VK_NULL_HANDLE) {
+                    const auto previous =
+                        instance_info->swapchainInfos.find(info->oldSwapchain);
+                    return previous != instance_info->swapchainInfos.end()
+                        ? extentsFor(previous->second) : std::nullopt;
+                }
+
+                std::optional<SpatialScalingExtents> unique;
+                for (const auto& [handle, swapchainInfo] :
+                        instance_info->swapchainInfos) {
+                    static_cast<void>(handle);
+                    const auto candidate = extentsFor(swapchainInfo);
+                    if (!candidate)
+                        continue;
+                    if (unique)
+                        return std::nullopt;
+                    unique = candidate;
+                }
+                return unique;
+            }();
+            if (previousSwapchainExtents)
+                previousVariableExtents = previousSwapchainExtents;
+            // The application already destroyed this null-old predecessor.
+            // Complete its existing fence/grace-protected retirement before
+            // querying live memory for the replacement. Otherwise admission
+            // charges the old WSI/private buffers against their replacement
+            // and can permanently discard a valid scaling envelope.
+            // Keep the copied surface proof above; non-null oldSwapchain
+            // contexts remain application-owned and are not retired here.
+            bool retiredNullOldReplacement{false};
+            const auto retainedOldSwapchain =
+                retainedSwapchainBeforeNullOldReplacement(
+                    device,
+                    info->surface,
+                    info->oldSwapchain
+                );
+            if (retainedOldSwapchain) {
+                if (!finalizeRetiredSwapchain(
+                        *retainedOldSwapchain,
+                        UINT64_MAX,
+                        "replacement-create")) {
+                    throw ls::vulkan_error(
+                        VK_ERROR_INITIALIZATION_FAILED,
+                        "retained swapchain retirement failed "
+                        "before null-old replacement"
+                    );
+                }
+                retiredNullOldReplacement = true;
+                if (present_diagnostics::enabled()) {
+                    std::cerr << "MAKO Renderer: present diagnostics: "
+                                 "operation=swapchain-retirement-before-replacement"
+                              << " role=" << layerRoleName
+                              << " swapchain="
+                              << *retainedOldSwapchain
+                              << " surface=" << info->surface
+                              << " reason=null-upper-old-swapchain"
+                              << " lower_old_swapchain=0"
+                              << " action=destroy-before-create"
+                              << '\n';
+                }
+            }
+            LowerFixedSurfaceContractLookupState lowerCreateRelayState(
+                FixedSurfaceCapabilityRelayOperation::BeginCreate,
+                FixedSurfaceCapabilityRelayOperation::ConsumeCreate
+            );
+            if (spatialScalingOwnedByLayer() &&
+                    spatialScalingCapabilityRelayByLayer()) {
+                beginLowerFixedSurfaceCapabilityRelay(
+                    lowerCreateRelayState, it->second.physdev()
+                );
+            }
+            bool spatialScalingActivationSupported =
+                spatialSurfaceScalingSupported(info->surface);
+            const auto offscreenWindow = offscreenX11Window(info->surface);
+            if (offscreenWindow) {
+                const auto& nesting = *offscreenWindow;
+                std::cerr << "MAKO Renderer: offscreen X11 presentation window: "
+                             "window=" << nesting.width << 'x' << nesting.height
+                          << "; top_level=" << nesting.topLevelWidth << 'x'
+                          << nesting.topLevelHeight << '\n';
+            }
+            auto modification =
+                layer_info->root.modifySwapchainCreateInfo(
+                    it->second, newInfo, previousVariableExtents,
+                    variableSurfaceRollbackExtents,
+                    fixedSurfaceContract,
+                    spatialScalingActivationSupported,
+                    instance_info->scalingSurfaces &&
+                        instance_info->scalingSurfaces->owns(info->surface),
+                    offscreenWindow.has_value(),
+                    [&](const FixedSurfaceScalingContract& contract) {
+#if defined(MAKO_LAYER_ROLE_SPATIAL_SCALING)
+                        if (spatialScalingCapabilityOwnedByLayer() &&
+                                !spatialScalingOwnedByLayer()) {
+                            spatialCreateRelay.publish(
+                                it->second.physdev(), info->surface, contract
+                            );
+                        }
+#else
+                        static_cast<void>(contract);
+#endif
+                    },
+                    [&, newInfo = &newInfo]() {
+                        auto driverInfo = *newInfo;
+                        if (instance_info->scalingSurfaces) {
+                            const auto prepared = instance_info->scalingSurfaces->prepareSwapchain(
+                                it->second.physdev(), driverInfo,
+                                instance_info->funcs.GetPhysicalDeviceSurfaceFormatsKHR);
+                            if (prepared != VK_SUCCESS)
+                                throw ls::vulkan_error(prepared, "HDR surface format is unavailable");
+                        }
+#if defined(VK_EXT_present_timing) && defined(VK_KHR_present_id2)
+                        // The bridge already owns protocol timing. Native and
+                        // full-WSI surfaces negotiate their own Vulkan contract.
+                        if (instance_info->presentTimingDevices.contains(device) &&
+                                !(instance_info->scalingSurfaces &&
+                                  instance_info->scalingSurfaces->owns(info->surface))) {
+                            const auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR>(
+                                lowerInstanceProcAddr(it->second.inst(),
+                                    "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
+                            VkSurfaceCapabilitiesPresentId2KHR ids{
+                                .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR,
+                            };
+                            VkPresentTimingSurfaceCapabilitiesEXT timing{
+                                .sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT,
+                                .pNext = &ids,
+                            };
+                            VkSurfaceCapabilities2KHR caps{
+                                .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
+                                .pNext = &timing,
+                            };
+                            const VkPhysicalDeviceSurfaceInfo2KHR surface{
+                                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+                                .surface = driverInfo.surface,
+                            };
+                            ownedPresentTiming = query &&
+                                query(it->second.physdev(), &surface, &caps) == VK_SUCCESS &&
+                                OwnedPresentTiming::surfaceSupported(timing, ids);
+                            if (ownedPresentTiming)
+                                driverInfo.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT |
+                                    VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR;
+                        }
+#endif
+                        const uint32_t provisionedMinImages =
+                            newInfo->minImageCount;
+                        auto res = it->second.df().CreateSwapchainKHR(
+                            device, &driverInfo, alloc, swapchain);
+                        if (shouldRetrySwapchainWithApplicationMinimum(
+                                res, info->minImageCount,
+                                provisionedMinImages)) {
+                            const VkResult initialResult = res;
+                            VkSwapchainCreateInfoKHR retryInfo = driverInfo;
+                            retryInfo.minImageCount = info->minImageCount;
+                            *swapchain = VK_NULL_HANDLE;
+                            res = it->second.df().CreateSwapchainKHR(
+                                device, &retryInfo, alloc, swapchain
+                            );
+                            if (present_diagnostics::enabled()) {
+                                std::cerr << "MAKO Renderer: present diagnostics: "
+                                             "operation=swapchain-create-compatibility-retry"
+                                          << " role=" << layerRoleName
+                                          << " initial_result="
+                                          << static_cast<int>(initialResult)
+                                          << " retry_result="
+                                          << static_cast<int>(res)
+                                          << " requested_min_images="
+                                          << info->minImageCount
+                                          << " provisioned_min_images="
+                                          << provisionedMinImages
+                                          << " retry_min_images="
+                                          << retryInfo.minImageCount
+                                          << " action="
+                                          << (res == VK_SUCCESS
+                                                ? "use-application-minimum"
+                                                : "propagate-retry-failure")
+                                          << '\n';
+                            }
+                            if (res == VK_SUCCESS)
+                                newInfo->minImageCount = retryInfo.minImageCount;
+                        }
+                        if (res != VK_SUCCESS) {
+                            throw ls::vulkan_error(
+                                res, "vkCreateSwapchainKHR() failed"
+                            );
+                        }
+                        createdSwapchain = *swapchain;
+                        lowerSwapchainCreated = true;
+                        // Optional private ABI: no change to application or WSI
+                        // formats. Supply the initial shader choice before images.
+                        using SetHdrPrecision = VkBool32 (VKAPI_PTR *)(
+                            VkDevice, VkSwapchainKHR, VkBool32);
+                        const auto setHdrPrecision = reinterpret_cast<SetHdrPrecision>(
+                            instance_info->funcs.GetDeviceProcAddr(device,
+                                "makoSetSwapchainHdrPrecisionV1"));
+                        if (setHdrPrecision)
+                            setHdrPrecision(device, *swapchain,
+                                layer_info->root.hdrCompactBuffersEnabled());
+                        if (driverInfo.imageColorSpace != newInfo->imageColorSpace) {
+                            // vkBasalt sees the driver's SRGB transport pair. Supply
+                            // the original colour space before it exposes images or
+                            // builds an effect graph; never infer HDR from bit depth.
+                            using SetColorSpace = VkBool32 (VKAPI_PTR *)(
+                                VkDevice, VkSwapchainKHR, VkColorSpaceKHR);
+                            const auto setColorSpace = reinterpret_cast<SetColorSpace>(
+                                instance_info->funcs.GetDeviceProcAddr(device,
+                                    "makoSetSwapchainColorSpaceV1"));
+                            if (setColorSpace) {
+                                if (!setColorSpace(device, *swapchain, newInfo->imageColorSpace))
+                                    throw ls::vulkan_error(VK_ERROR_FORMAT_NOT_SUPPORTED,
+                                        "shader layer rejected the HDR colour-space handoff");
+                            } else if (environmentFlagEnabled(std::getenv("ENABLE_VKBASALT"))) {
+                                throw ls::vulkan_error(VK_ERROR_FORMAT_NOT_SUPPORTED,
+                                    "HDR shaders require the colour-aware MAKO vkBasalt build");
+                            }
+                        }
+                    }
+                );
+            const auto lowerCreateRelay = lowerCreateRelayState.consume();
+            const auto lowerCreateDecision = lowerCreateRelay
+                ? classifySpatialCreateRelay(
+                    lowerCreateRelay->contract, info->imageExtent
+                )
+                : SpatialCreateRelayDecision::Unavailable;
+            const bool lowerCreateSplitDecision = lowerCreateDecision ==
+                SpatialCreateRelayDecision::Split;
+            const bool lowerCreateNativeDecision = lowerCreateDecision ==
+                SpatialCreateRelayDecision::Native;
+            if (lowerCreateSplitDecision) {
+                const bool relayAdjustedUpperPrediction =
+                    !modification.spatialScalingActive ||
+                    !sameExtent(
+                        modification.applicationExtent,
+                        lowerCreateRelay->contract.extents.source
+                    ) ||
+                    !sameExtent(
+                        modification.presentationExtent,
+                        lowerCreateRelay->contract.extents.presentation
+                    );
+                modification.applicationExtent =
+                    lowerCreateRelay->contract.extents.source;
+                modification.presentationExtent =
+                    lowerCreateRelay->contract.extents.presentation;
+                modification.spatialScalingActive = true;
+                modification.variableSurface =
+                    lowerCreateRelay->contract.variableSurface;
+                modification.spatialScalingMemoryConstrained =
+                    lowerCreateRelay->contract.memoryBudgetConstrained;
+                modification.spatialScalingInactiveReason =
+                    SpatialScalingInactiveReason::None;
+                newInfo.imageExtent = modification.presentationExtent;
+                std::cerr << "MAKO Renderer: spatial scaling create relay applied: "
+                          << "role=" << layerRoleName
+                          << "; source="
+                          << modification.applicationExtent.width << 'x'
+                          << modification.applicationExtent.height
+                          << "; presentation="
+                          << modification.presentationExtent.width << 'x'
+                          << modification.presentationExtent.height
+                          << "; relay_surface_mode="
+                          << (lowerCreateRelay->lowerSurface == info->surface
+                                ? "shared" : "aliased")
+                          << "; ownership=upper-combined-role"
+                          << "; surface_extent_mode="
+                          << (modification.variableSurface
+                                ? "variable" : "fixed")
+                          << "; memory_budget_constrained="
+                          << modification.spatialScalingMemoryConstrained
+                          << "; source_presentation_split=1"
+                          << "; active=1"
+                          << "; relay_adjusted_upper_prediction="
+                          << relayAdjustedUpperPrediction
+                          << "; pipeline=combined-cost-aware\n";
+            } else if (lowerCreateNativeDecision) {
+                // The lower extent owner is authoritative even when the upper
+                // role could independently derive a variable-surface split.
+                // A native result means WSI did not provide a safe compositor
+                // presentation surface, so discard the upper prediction and
+                // keep frame generation on the application's exact extent.
+                modification.applicationExtent = info->imageExtent;
+                modification.presentationExtent = info->imageExtent;
+                modification.spatialScalingActive = false;
+                modification.variableSurface =
+                    lowerCreateRelay->contract.variableSurface;
+                modification.spatialScalingMemoryConstrained = false;
+                modification.spatialScalingInactiveReason =
+                    lowerCreateRelay->contract.inactiveReason;
+                newInfo.imageExtent = info->imageExtent;
+                spatialScalingActivationSupported = lowerCreateRelay->contract
+                    .spatialSurfaceScalingSupported;
+                std::cerr << "MAKO Renderer: spatial scaling create relay applied: "
+                          << "role=" << layerRoleName
+                          << "; source=" << info->imageExtent.width << 'x'
+                          << info->imageExtent.height
+                          << "; presentation=" << info->imageExtent.width << 'x'
+                          << info->imageExtent.height
+                          << "; relay_surface_mode="
+                          << (lowerCreateRelay->lowerSurface == info->surface
+                                ? "shared" : "aliased")
+                          << "; ownership=upper-combined-role"
+                          << "; source_presentation_split=0"
+                          << "; active=0"
+                          << "; action=native"
+                          << "; inactive_reason="
+                          << spatialScalingInactiveReasonName(
+                                modification.spatialScalingInactiveReason
+                             )
+                          << '\n';
+            } else if (shouldRejectUncontractedSpatialCreate(
+                    layer_info->root.scalingEngineProvisioned(),
+                    modification.spatialScalingActive,
+                    lowerCreateSplitDecision || lowerCreateNativeDecision)) {
+                std::cerr << "MAKO Renderer: spatial scaling create relay unavailable: "
+                          << "role=" << layerRoleName
+                          << "; requested=" << info->imageExtent.width << 'x'
+                          << info->imageExtent.height
+                          << "; action=reject-transient-native-context"
+                          << "; inactive_reason=no-lower-create-contract\n";
+                throw ls::vulkan_error(
+                    VK_ERROR_INITIALIZATION_FAILED,
+                    "the combined scaling/frame-generation owner did not "
+                    "receive the lower WSI extent contract"
+                );
+            }
+            const auto commitVariableSurfaceScaling = [&]() {
+                const std::lock_guard lock(
+                    instance_info->surfaceScalingMutex
+                );
+                // The current lower split role owns extent selection but not
+                // reconstruction resources. Retain its successful variable
+                // source/presentation pair even though spatialScalingActive
+                // is intentionally false for that allocation-free context;
+                // later lower creates need this proven presentation envelope
+                // before the upper resource owner can consume the relay.
+                const bool spatialScalingExtentSelected =
+                    modification.spatialScalingActive ||
+                    (spatialScalingCapabilityOwnedByLayer() &&
+                        !sameExtent(
+                            modification.applicationExtent,
+                            modification.presentationExtent
+                        ));
+                const auto committedRollback =
+                    committedVariableSurfaceRollbackExtents(
+                        previousVariableExtents,
+                        variableSurfaceRollbackExtents,
+                        layer_info->root.active(),
+                        modification.variableSurface,
+                        spatialScalingExtentSelected,
+                        modification.variableFeedbackSuppressed,
+                        modification.retainVariableSurfaceProof,
+                        modification.spatialScalingMemoryConstrained,
+                        modification.applicationExtent,
+                        modification.presentationExtent
+                    );
+                const auto committed =
+                    modification.spatialScalingAdmissionRetryEligible &&
+                        previousVariableExtents
+                    ? previousVariableExtents
+                    : committedVariableSurfaceScalingExtents(
+                        previousVariableExtents,
+                        layer_info->root.active(),
+                        modification.variableSurface,
+                        spatialScalingExtentSelected,
+                        modification.variableFeedbackSuppressed,
+                        modification.retainVariableSurfaceProof,
+                        modification.applicationExtent,
+                        modification.presentationExtent,
+                        modification.retainVariableSurfacePresentationProof
+                    );
+                if (committed) {
+                    instance_info->variableSurfaceScalingExtents.insert_or_assign(
+                        info->surface, *committed
+                    );
+                } else {
+                    instance_info->variableSurfaceScalingExtents.erase(
+                        info->surface
+                    );
+                }
+                if (committedRollback) {
+                    instance_info->variableSurfaceRollbackExtents
+                        .insert_or_assign(info->surface, *committedRollback);
+                } else {
+                    instance_info->variableSurfaceRollbackExtents.erase(
+                        info->surface
+                    );
+                }
+            };
+
+            // The internal display resize must not shrink CAS/DLS from one source
+            // pixel to one display pixel. Hand off admitted source geometry
+            // before vkBasalt exposes images and builds its immutable graph.
+            if (bridgeDisplayResizeSharpenSourceRequired(
+                    modification.bridgeDisplayResize,
+                    modification.spatialScalingActive,
+                    modification.applicationExtent,
+                    modification.presentationExtent)) {
+                using SetSharpenSource = VkBool32 (VKAPI_PTR *)(
+                    VkDevice, VkSwapchainKHR, uint32_t, uint32_t);
+                const auto setSharpenSource = reinterpret_cast<SetSharpenSource>(
+                    instance_info->funcs.GetDeviceProcAddr(device,
+                        "makoSetSwapchainSharpenSourceExtentV1"));
+                if (setSharpenSource) {
+                    const auto source = modification.applicationExtent;
+                    const auto accepted = setSharpenSource(
+                        device, *swapchain, source.width, source.height);
+                    std::cerr << "MAKO Renderer: HDR shader source footprint: "
+                              << "source=" << source.width << 'x' << source.height
+                              << "; output=" << modification.presentationExtent.width
+                              << 'x' << modification.presentationExtent.height
+                              << "; accepted=" << accepted << '\n';
+                }
+            }
+
+            // get all swapchain images
+            uint32_t imageCount{};
+            auto res = it->second.df().GetSwapchainImagesKHR(device, *swapchain,
+                &imageCount, VK_NULL_HANDLE);
+            if (res != VK_SUCCESS)
+                throw ls::vulkan_error(res, "vkGetSwapchainImagesKHR() failed");
+            if (imageCount == 0)
+                throw ls::vulkan_error(
+                    VK_ERROR_INITIALIZATION_FAILED,
+                    "vkGetSwapchainImagesKHR() returned no images"
+                );
+
+            std::vector<VkImage> swapchainImages(imageCount);
+            res = it->second.df().GetSwapchainImagesKHR(device, *swapchain,
+                &imageCount, swapchainImages.data());
+            if (res != VK_SUCCESS)
+                throw ls::vulkan_error(res, "vkGetSwapchainImagesKHR() failed");
+
+            if (instance_info->scalingSurfaces &&
+                    !instance_info->scalingSurfaces->createSwapchain(
+                        info->surface, *swapchain, newInfo, info->imageExtent, imageCount,
+                        instance_info->engineName,
+                        modification.gamescopeProtocolPresentMode,
+                        modification.gamescopePresentRefreshHz)) {
+                throw ls::vulkan_error(
+                    VK_ERROR_SURFACE_LOST_KHR,
+                    "Gamescope scaling surface swapchain feedback failed"
+                );
+            }
+            if (present_diagnostics::enabled() &&
+                    instance_info->scalingSurfaces &&
+                    instance_info->scalingSurfaces->owns(info->surface)) {
+                std::cerr << "MAKO Renderer: present diagnostics: "
+                             "operation=gamescope-scaling-swapchain-feedback"
+                          << " surface=" << info->surface
+                          << " swapchain=" << *swapchain
+                          << " image_count=" << imageCount
+                          << " format=" << static_cast<uint32_t>(
+                                newInfo.imageFormat)
+                          << " color_space=" << static_cast<uint32_t>(
+                                newInfo.imageColorSpace)
+                          << " requested_old_swapchain="
+                          << info->oldSwapchain
+                          << " lower_present_mode="
+                          << static_cast<uint32_t>(newInfo.presentMode)
+                          << " compositor_present_mode="
+                          << (modification.gamescopeProtocolPresentMode
+                                ? static_cast<int64_t>(
+                                    *modification.gamescopeProtocolPresentMode)
+                                : -1)
+                          << " action=fresh-protocol-lifetime"
+                          << '\n';
+            }
+
+            auto& swapchainInfo = instance_info->swapchainInfos.emplace(*swapchain, SwapchainInfo {
+                .images = std::move(swapchainImages),
+                .surface = info->surface,
+                .gamescopeScalingSurface = instance_info->scalingSurfaces &&
+                        instance_info->scalingSurfaces->owns(info->surface)
+                    ? instance_info->scalingSurfaces.get() : nullptr,
+                .gamescopeDisplayTiming =
+                    instance_info->gamescopeTimingDevices.contains(device),
+                .ownedPresentTiming = ownedPresentTiming,
+                .gamescopeSession = layer_info->root.gamescopeSessionDetected(),
+                .format = newInfo.imageFormat,
+                .colorSpace = newInfo.imageColorSpace,
+                .imageUsage = newInfo.imageUsage,
+                .requestedMinImageCount = info->minImageCount,
+                .provisionedMinImageCount = newInfo.minImageCount,
+                .swapchainImageCountCompatibility =
+                    modification.swapchainImageCountCompatibility,
+                .applicationOldSwapchainProvided =
+                    info->oldSwapchain != VK_NULL_HANDLE,
+                .applicationExtent = modification.applicationExtent,
+                .extent = newInfo.imageExtent,
+                .gamescopePresentationTarget =
+                    modification.gamescopePresentationTarget,
+                .incomingPresentMode = info->presentMode,
+                .presentMode = modification.gamescopeProtocolPresentMode
+                    .value_or(newInfo.presentMode),
+                .privateOrderedTransport =
+                    modification.privateOrderedTransport,
+                .frameGenerationSurfaceUnavailable =
+                    modification.frameGenerationSurfaceUnavailable,
+                .spatialScalingActive =
+                    modification.spatialScalingActive,
+                .bridgeDisplayResize = modification.bridgeDisplayResize,
+                .variableSurface = modification.variableSurface,
+                .spatialScalingMemoryConstrained =
+                    modification.spatialScalingMemoryConstrained,
+                .spatialScalingAdmissionRetryEligible =
+                    modification.spatialScalingAdmissionRetryEligible &&
+                    swapchainCreateIsReplacement(
+                        newInfo.oldSwapchain, retiredNullOldReplacement
+                    ),
+                .spatialScalingPolicyRevision =
+                    modification.spatialScalingPolicyRevision,
+                .spatialScalingInactiveReason =
+                    modification.spatialScalingInactiveReason,
+                .spatialScalingActivationSupported =
+                    spatialScalingActivationSupported,
+                .replacement = swapchainCreateIsReplacement(
+                    newInfo.oldSwapchain, retiredNullOldReplacement
+                ),
+                .applicationAcquireWindow = applicationAcquireBudgetApplies(
+                    deviceEngineName(device), info->minImageCount,
+                    newInfo.minImageCount, modification.surfaceMinImageCount
+                ),
+            }).first->second;
+
+            // An enabled implicit layer can run in a process that does not
+            // match a configured game profile (launchers and helper processes
+            // are common examples). Keep that process on its original Vulkan
+            // presentation path without attempting to construct MAKO's
+            // optional backend.
+            if (!layer_info->root.active()) {
+                instance_info->swapchains.emplace(
+                    *swapchain, ls::R<vk::Vulkan>(it->second)
+                );
+                instance_info->nativeSwapchains.insert(*swapchain);
+                commitVariableSurfaceScaling();
+                lowerSwapchainCreated = false;
+                return res;
+            }
+
+            // Creating interpolation resources is optional. If the game's
+            // lower swapchain is valid but MAKO's private backend cannot start
+            // (for example an unavailable DLL or unsupported private-device
+            // capability), retain the real-frame presentation path instead of
+            // turning an engine failure into a game startup failure.
+            try {
+                layer_info->root.createSwapchainContext(
+                    it->second, *swapchain, swapchainInfo,
+                    instance_info->presentRetirementDevices.contains(device)
+                );
+            } catch (const std::exception& e) {
+                // The lower image is native-sized when scaling is active,
+                // while the application intentionally renders only the
+                // virtual source rectangle. Falling back to direct native
+                // presentation would expose an incomplete top-left frame, so
+                // fail creation and let the normal rollback destroy the lower
+                // swapchain instead.
+                if (swapchainInfo.spatialScalingActive)
+                    throw ls::error(
+                        "spatial scaling context initialization failed", e
+                    );
+                instance_info->swapchains.emplace(
+                    *swapchain, ls::R<vk::Vulkan>(it->second)
+                );
+                instance_info->nativeSwapchains.insert(*swapchain);
+                commitVariableSurfaceScaling();
+                lowerSwapchainCreated = false;
+                std::cerr << "MAKO Renderer: frame-generation context initialization "
+                             "failed; native presentation retained:\n"
+                          << "- " << e.what() << '\n';
+                return res;
+            }
+
+            instance_info->swapchains.emplace(*swapchain,
+                ls::R<vk::Vulkan>(it->second));
+            if (swapchainInfo.applicationAcquireWindow) {
+                auto budget = std::make_shared<ApplicationAcquireBudget>(
+                    info->minImageCount, modification.surfaceMinImageCount
+                );
+                if (present_diagnostics::enabled()) {
+                    std::cerr << "MAKO Renderer: present diagnostics: "
+                                 "operation=application-acquire-budget"
+                              << " swapchain=" << *swapchain
+                              << " engine=zink"
+                              << " requested_images=" << info->minImageCount
+                              << " provisioned_images=" << newInfo.minImageCount
+                              << " surface_min_images="
+                              << modification.surfaceMinImageCount
+                              << " window=" << budget->window() << '\n';
+                }
+                const std::lock_guard lock(instance_info->acquireBudgetsMutex);
+                instance_info->acquireBudgets[*swapchain] = std::move(budget);
+                instance_info->acquireBudgetsPresent.store(
+                    true, std::memory_order_release);
+            }
+
+            commitVariableSurfaceScaling();
+            lowerSwapchainCreated = false;
+            return res;
+        } catch (const ls::vulkan_error& e) {
+            rollbackCreatedSwapchain();
+            std::cerr << "MAKO Renderer: swapchain creation failed:\n";
+            std::cerr << "- " << e.what() << '\n';
+            return e.error();
+        } catch (const std::exception& e) {
+            rollbackCreatedSwapchain();
+            std::cerr << "MAKO Renderer: swapchain creation failed:\n";
+            std::cerr << "- " << e.what() << '\n';
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+    }
+
+    // Time the application spends inside MAKO's acquire and present calls
+    // for one swapchain on this thread. Its share of each source interval
+    // separates a self-capped source from one held by generated FIFO work.
+    // A different thread or swapchain leaves that share unknown.
+    struct ApplicationLayerTime {
+        VkSwapchainKHR swapchain{VK_NULL_HANDLE};
+        std::optional<std::chrono::steady_clock::time_point> presentEnteredAt;
+        std::chrono::steady_clock::duration presentDuration{};
+        std::chrono::steady_clock::duration acquireDuration{};
+        uint32_t acquires{0};
+    };
+    thread_local ApplicationLayerTime applicationLayerTime;
+
+    // Returns the previous source interval's share and starts the next one.
+    std::optional<double> beginApplicationLayerPresent(
+            const VkSwapchainKHR swapchain,
+            const std::chrono::steady_clock::time_point entered) {
+        auto& time = applicationLayerTime;
+        std::optional<double> share;
+        if (time.swapchain == swapchain && time.presentEnteredAt &&
+                time.acquires > 0 && entered > *time.presentEnteredAt) {
+            share = std::chrono::duration<double>(
+                    time.presentDuration + time.acquireDuration).count() /
+                std::chrono::duration<double>(
+                    entered - *time.presentEnteredAt).count();
+        }
+        time = {.swapchain = swapchain, .presentEnteredAt = entered};
+        return share;
+    }
+
+    std::shared_ptr<ApplicationAcquireBudget> applicationAcquireBudget(
+            const VkSwapchainKHR swapchain) {
+        if (!instance_info->acquireBudgetsPresent.load(std::memory_order_acquire))
+            return nullptr;
+        const std::lock_guard lock(instance_info->acquireBudgetsMutex);
+        const auto found = instance_info->acquireBudgets.find(swapchain);
+        return found == instance_info->acquireBudgets.end()
+            ? nullptr : found->second;
+    }
+
+    // Only an infinite acquire waits for the window. Finite timeouts keep the
+    // driver's exact result: Zink retries them with growing timeouts and
+    // aborts after a bounded number, so a synthetic timeout is never safe.
+    template<typename Acquire>
+    VkResult acquireWithinApplicationBudget(const VkSwapchainKHR swapchain,
+            const uint64_t timeout, Acquire&& acquire) {
+        const auto budget = applicationAcquireBudget(swapchain);
+        if (!budget)
+            return acquire();
+        if (timeout == UINT64_MAX &&
+                !budget->waitForSlot(ApplicationAcquireBudget::fallbackWait())) {
+            budget->forgetHeldImages();
+            if (budget->firstFallback()) {
+                std::cerr << "MAKO Renderer: application acquire budget wait "
+                             "expired; acquiring without it"
+                          << " swapchain=" << swapchain
+                          << " window=" << budget->window() << '\n';
+            }
+        }
+        const VkResult result = acquire();
+        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
+            budget->acquired();
+        return result;
+    }
+
+    template<typename Acquire>
+    VkResult timeApplicationAcquire(const VkSwapchainKHR swapchain,
+            Acquire&& acquire) {
+        const auto started = std::chrono::steady_clock::now();
+        const VkResult result = acquire();
+        auto& time = applicationLayerTime;
+        if (time.swapchain != swapchain)
+            time = {.swapchain = swapchain};
+        time.acquireDuration += std::chrono::steady_clock::now() - started;
+        time.acquires++;
+        return result;
+    }
+
+    void rejectIndependentPresentation(IndependentRealPresent& context) {
+        context.invalidate();
+        const std::lock_guard lock(instance_info->surfaceScalingMutex);
+        instance_info->independentRealRejectedSurfaces.insert(context.applicationSurface());
+    }
+
+    VkResult myvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunknown-warning-option"
+#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
+        if (info->swapchainCount > 1 && !instance_info->independentRealSwapchains.empty()) {
+            PFN_vkQueueSubmit submit{};
+            for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+                if (const auto found = instance_info->independentRealSwapchains.find(info->pSwapchains[i]);
+                        found != instance_info->independentRealSwapchains.end()) {
+                    rejectIndependentPresentation(*found->second);
+                    submit = instance_info->swapchains.at(found->first).get().df().QueueSubmit;
+                }
+            }
+            if (submit) return completeRejectedPresent(submit, queue, *info, VK_ERROR_OUT_OF_DATE_KHR);
+        }
+        if (info->swapchainCount == 1) {
+            IndependentRealPresent* indepPtr = nullptr;
+            const vk::Vulkan* vkPtr = nullptr;
+            InstanceInfo::QueueIdentity qId{};
+            bool hasQId = false;
+            {
+                const std::shared_lock regLock(registryMutex());
+                const auto found = instance_info->independentRealSwapchains.find(info->pSwapchains[0]);
+                if (found != instance_info->independentRealSwapchains.end()) {
+                    indepPtr = found->second.get();
+                    vkPtr = &instance_info->swapchains.at(found->first).get();
+                    const auto identity = instance_info->queueIdentities.find(queue);
+                    if (identity != instance_info->queueIdentities.end()) {
+                        qId = identity->second;
+                        hasQId = true;
+                    }
+                }
+            }
+            if (indepPtr && vkPtr) {
+                VkResult result = VK_ERROR_OUT_OF_DATE_KHR;
+                auto& context = *indepPtr;
+                bool sourceSubmitted = false;
+                const auto& vk = *vkPtr;
+                try {
+                    if (!context.active() || !hasQId ||
+                            qId.device != vk.dev() || qId.familyIndex != vk.queueFamilyIndex()) {
+                        std::clog << "MAKO Renderer: independent-real rejected presentation shape\n";
+                    } else result = context.present(queue, *info, sourceSubmitted);
+                } catch (const ls::vulkan_error& error) {
+                    std::clog << "MAKO Renderer: independent-real presentation error: " << error.what() << '\n';
+                    if (error.error() == VK_ERROR_DEVICE_LOST) result = error.error();
+                } catch (const std::exception& error) {
+                    std::clog << "MAKO Renderer: independent-real presentation failed: " << error.what() << '\n';
+                }
+                if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+                    rejectIndependentPresentation(context);
+                    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_ERROR_SURFACE_LOST_KHR) {
+                        auto drain = *info;
+                        if (sourceSubmitted) {
+                            drain.waitSemaphoreCount = 0;
+                            drain.pWaitSemaphores = nullptr;
+                        }
+                        return completeRejectedPresent(vk.df().QueueSubmit, queue, drain, result);
+                    }
+                }
+                if (info->pResults) info->pResults[0] = result;
+                return result;
+            }
+        }
+        present_diagnostics::ApplicationPresentScope timingScope(
+            queue, info->swapchainCount == 1 ? info->pSwapchains[0] : VK_NULL_HANDLE
+        );
+        // Return each presented image to its application window only after
+        // MAKO's present work, so a waiting acquire carries MAKO's pacing.
+        struct ApplicationAcquireRelease {
+            std::vector<std::shared_ptr<ApplicationAcquireBudget>> budgets;
+            ~ApplicationAcquireRelease() {
+                for (const auto& budget : this->budgets)
+                    budget->presented();
+            }
+        } applicationAcquireRelease;
+        for (uint32_t i = 0; i < info->swapchainCount &&
+                instance_info->acquireBudgetsPresent.load(
+                    std::memory_order_acquire); ++i) {
+            if (auto budget = applicationAcquireBudget(info->pSwapchains[i]))
+                applicationAcquireRelease.budgets.push_back(std::move(budget));
+        }
+        const auto presentEntered = std::chrono::steady_clock::now();
+        const std::optional<double> applicationLayerShare =
+            info->swapchainCount == 1
+                ? beginApplicationLayerPresent(info->pSwapchains[0], presentEntered)
+                : std::nullopt;
+        struct ApplicationLayerPresentScope {
+            VkSwapchainKHR swapchain;
+            std::chrono::steady_clock::time_point entered;
+            ~ApplicationLayerPresentScope() {
+                if (applicationLayerTime.swapchain == this->swapchain)
+                    applicationLayerTime.presentDuration =
+                        std::chrono::steady_clock::now() - this->entered;
+            }
+        } applicationLayerPresentScope{
+            info->swapchainCount == 1 ? info->pSwapchains[0] : VK_NULL_HANDLE,
+            presentEntered,
+        };
+        VkResult result = VK_SUCCESS;
+        bool swapchainOutOfDate = false;
+
+        // Binary application wait semaphores belong to the whole present
+        // batch and may be consumed only once. The existing per-swapchain FG
+        // transport cannot yet preserve that contract for any managed MAKO
+        // context, so reject before submitting any work rather than wait
+        // twice, deadlock, or misassociate per-swapchain pNext arrays.
+        if (info->swapchainCount > 1) {
+            bool containsManagedMakoContext = false;
+            for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+                const auto metadata = instance_info->swapchainInfos.find(
+                    info->pSwapchains[i]
+                );
+                containsManagedMakoContext = containsManagedMakoContext ||
+                    (metadata != instance_info->swapchainInfos.end() &&
+                     !instance_info->nativeSwapchains.contains(
+                        info->pSwapchains[i]
+                     ));
+            }
+            if (shouldRejectManagedMultiSwapchainPresent(
+                    info->swapchainCount, containsManagedMakoContext)) {
+                constexpr VkResult unsupported =
+                    VK_ERROR_UNKNOWN;
+                if (info->pResults) {
+                    std::fill_n(
+                        info->pResults, info->swapchainCount, unsupported
+                    );
+                }
+                std::cerr << "MAKO Renderer: multi-swapchain managed present "
+                             "rejected before semaphore consumption; batch "
+                             "frame generation and scaling are not supported\n";
+                return unsupported;
+            }
+        }
+
+        if (instance_info->scalingSurfaces) {
+            for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+                const auto metadata = instance_info->swapchainInfos.find(info->pSwapchains[i]);
+                if (instance_info->nativeSwapchains.contains(info->pSwapchains[i]) &&
+                        metadata != instance_info->swapchainInfos.end() &&
+                        metadata->second.gamescopeScalingSurface) {
+                    const auto prepared = metadata->second.gamescopeScalingSurface->preparePresent(
+                        metadata->second.surface, info->pSwapchains[i]);
+                    if (prepared != VK_SUCCESS) {
+                        const auto mapping = instance_info->swapchains.find(info->pSwapchains[i]);
+                        if (mapping == instance_info->swapchains.end())
+                            return VK_ERROR_INITIALIZATION_FAILED;
+                        return completeRejectedPresent(mapping->second.get().df().QueueSubmit,
+                            queue, *info, prepared);
+                    }
+                }
+            }
+        }
+
+        // A context that failed after the lower swapchain was created remains
+        // a normal application swapchain. Bypass MAKO for the whole batch so
+        // the driver's wait-semaphore and per-swapchain result semantics stay
+        // exactly as the application supplied them.
+        for (size_t i = 0; i < info->swapchainCount; ++i) {
+            const auto swapchain = info->pSwapchains[i];
+            if (!instance_info->nativeSwapchains.contains(swapchain))
+                continue;
+
+            const auto mapping = instance_info->swapchains.find(swapchain);
+            if (mapping == instance_info->swapchains.end()) {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            const VkResult nativeResult =
+                mapping->second.get().df().QueuePresentKHR(queue, info);
+            // A prior managed swapchain may still be retiring on this surface.
+            // Preserve native forwarding, then check its completion without waiting.
+            collectRetiredSwapchainsAfterPresent(queue, *info);
+            return nativeResult;
+        }
+
+        // ensure layer config is up to date
+        ConfigurationUpdateResult configurationUpdate;
+        timingScope.configurationUpdateStarted();
+        try {
+            configurationUpdate = layer_info->root.update();
+        } catch (const std::exception&) {
+            configurationUpdate = {}; // retain the last valid configuration
+        }
+        timingScope.configurationUpdateFinished();
+
+        if (configurationUpdate.reloaded) {
+            std::cerr << "MAKO Renderer: updated configuration in place; contexts="
+                      << configurationUpdate.liveContextsUpdated << '\n';
+            if (configurationUpdate.swapchainRecreationDeferredContexts > 0)
+                std::cerr << "MAKO Renderer: configuration changes requiring GPU resource "
+                             "reconstruction remain pending until a game-owned "
+                             "swapchain recreation; contexts="
+                          << configurationUpdate.swapchainRecreationDeferredContexts
+                          << '\n';
+            if (configurationUpdate.recreationRequestedContexts > 0)
+                std::cerr << "MAKO Renderer: live profile-resource changes will request "
+                             "game-owned swapchain recreation after the current lower "
+                             "present accepts a maintenance1 retirement fence; contexts="
+                          << configurationUpdate.recreationRequestedContexts
+                          << '\n';
+            if (configurationUpdate.processRestartDeferredContexts > 0 ||
+                    configurationUpdate.processProfileChangeDeferred ||
+                    configurationUpdate.globalChangeDeferred) {
+                std::cerr << "MAKO Renderer: process-static backend configuration remains "
+                             "pending until the game restarts; contexts="
+                          << configurationUpdate.processRestartDeferredContexts
+                          << "; profile="
+                          << configurationUpdate.processProfileChangeDeferred
+                          << "; global="
+                          << configurationUpdate.globalChangeDeferred << '\n';
+            }
+        }
+
+        // present each swapchain
+        for (size_t i = 0; i < info->swapchainCount; i++) {
+            const auto& swapchain = info->pSwapchains[i];
+
+            const auto& it = instance_info->swapchains.find(swapchain);
+            if (it == instance_info->swapchains.end()) {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+
+            std::optional<uint64_t> presentingContextId;
+            try {
+                const auto metadata =
+                    instance_info->swapchainInfos.find(swapchain);
+                if (metadata != instance_info->swapchainInfos.end() &&
+                        metadata->second.spatialScalingActive) {
+                    const auto identity =
+                        instance_info->queueIdentities.find(queue);
+                    if (identity == instance_info->queueIdentities.end() ||
+                            identity->second.familyIndex !=
+                                it->second.get().queueFamilyIndex() ||
+                            queue != it->second.get().queue()) {
+                        throw ls::vulkan_error(
+                            VK_ERROR_UNKNOWN,
+                            "spatial scaling requires the application's "
+                            "ordinary queue 0 from MAKO's graphics/compute "
+                            "presentation family"
+                        );
+                    }
+                }
+                const auto waitSemaphores = info->waitSemaphoreCount > 0
+                    ? std::span<const VkSemaphore>(
+                        info->pWaitSemaphores, info->waitSemaphoreCount
+                    )
+                    : std::span<const VkSemaphore>{};
+
+                auto& context = layer_info->root.getSwapchainContext(swapchain, it->second);
+                presentingContextId = context.diagnosticsId();
+                context.observeApplicationLayerShare(applicationLayerShare);
+                result = context.present(it->second,
+                    queue, swapchain,
+                    const_cast<void*>(info->pNext),
+                    info->pImageIndices[i],
+                    waitSemaphores
+                );
+                const bool liveProfileRecreationRequested =
+                    context.requestLiveProfileResourceRecreationAfterPresent(
+                        result
+                    );
+                const VkSurfaceKHR presentingSurface = metadata ==
+                        instance_info->swapchainInfos.end()
+                    ? VK_NULL_HANDLE
+                    : metadata->second.surface;
+                std::optional<ScalingAdmissionRetryKey>
+                    scalingAdmissionRetryKey;
+                if (metadata != instance_info->swapchainInfos.end() &&
+                        metadata->second.
+                            spatialScalingAdmissionRetryEligible) {
+                    scalingAdmissionRetryKey = ScalingAdmissionRetryKey{
+                        .sourceWidth =
+                            metadata->second.applicationExtent.width,
+                        .sourceHeight =
+                            metadata->second.applicationExtent.height,
+                        .policyRevision = metadata->second.
+                            spatialScalingPolicyRevision,
+                    };
+                } else if (presentingSurface != VK_NULL_HANDLE &&
+                        metadata != instance_info->swapchainInfos.end() &&
+                        metadata->second.spatialScalingActive) {
+                    instance_info->scalingAdmissionRetryStates.erase(
+                        presentingSurface
+                    );
+                }
+                bool scalingAdmissionRetrySurfaceAvailable = false;
+                if (presentingSurface != VK_NULL_HANDLE &&
+                        scalingAdmissionRetryKey) {
+                    scalingAdmissionRetrySurfaceAvailable = instance_info
+                        ->scalingAdmissionRetryStates[presentingSurface]
+                        .available(*scalingAdmissionRetryKey);
+                }
+                const bool scalingAdmissionRetryRequested =
+                    context.requestSpatialScalingAdmissionRetryAfterPresent(
+                        result,
+                        !liveProfileRecreationRequested &&
+                            scalingAdmissionRetrySurfaceAvailable
+                    );
+                if (scalingAdmissionRetryRequested &&
+                        scalingAdmissionRetryKey) {
+                    instance_info->scalingAdmissionRetryStates[
+                        presentingSurface
+                    ].record(*scalingAdmissionRetryKey);
+                    if (present_diagnostics::enabled()) {
+                        std::cerr << "MAKO Renderer: present diagnostics: "
+                                     "operation=spatial-scaling-admission-retry-budget"
+                                  << " surface=" << presentingSurface
+                                  << " source="
+                                  << scalingAdmissionRetryKey->sourceWidth
+                                  << 'x'
+                                  << scalingAdmissionRetryKey->sourceHeight
+                                  << " policy_revision="
+                                  << scalingAdmissionRetryKey->policyRevision
+                                  << " action=episode-consumed\n";
+                    }
+                }
+                const bool orderedAcquireRecoveryRecreationRequested =
+                    context.requestOrderedAcquireRecreationAfterPresent(
+                        result,
+                        !liveProfileRecreationRequested &&
+                            !scalingAdmissionRetryRequested
+                    );
+                if (liveProfileRecreationRequested ||
+                        scalingAdmissionRetryRequested ||
+                        orderedAcquireRecoveryRecreationRequested) {
+                    // This role owns the guarded request only after
+                    // Swapchain::present() returned from a successful lower
+                    // present. The application's acquired real image has
+                    // therefore already reached the presentation engine; make
+                    // that proof explicit before replacing the successful
+                    // result with the one-shot recreation signal.
+                    if (present_diagnostics::enabled()) {
+                        std::cerr << "MAKO Renderer: present diagnostics: "
+                                     "operation=original-present-recreation-propagate"
+                                  << " context=" << context.diagnosticsId()
+                                  << " result=" << VK_ERROR_OUT_OF_DATE_KHR
+                                  << " action=application-image-submitted-before-recreation\n";
+                    }
+                    result = VK_ERROR_OUT_OF_DATE_KHR;
+                }
+                if (result == VK_ERROR_OUT_OF_DATE_KHR &&
+                        present_diagnostics::enabled()) {
+                    std::cerr << "MAKO Renderer: present diagnostics: "
+                                 "operation=swapchain-recreation-observed"
+                              << " context=" << context.diagnosticsId()
+                              << " role=" << layerRoleName
+                              << " swapchain=" << swapchain
+                              << " source="
+                              << (liveProfileRecreationRequested
+                                    ? "guarded-live-profile-request"
+                                    : scalingAdmissionRetryRequested
+                                        ? "spatial-scaling-admission-retry"
+                                    : orderedAcquireRecoveryRecreationRequested
+                                        ? "transition-scoped-acquire-timeout"
+                                    : "upstream-or-driver")
+                              << '\n';
+                }
+            } catch (const ls::vulkan_error& e) {
+                if (e.error() != VK_ERROR_OUT_OF_DATE_KHR) {
+                    std::cerr << "MAKO Renderer: swapchain presentation failed:\n";
+                    std::cerr << "- " << e.what() << '\n';
+                } else if (presentingContextId &&
+                        present_diagnostics::enabled()) {
+                    // Some direct original-image paths report OUT_OF_DATE by
+                    // exception after the application image has already
+                    // traversed the lower role. Preserve the same upper-role
+                    // recreation observation as the normal returned-result
+                    // path so the game receives one coherent signal.
+                    std::cerr << "MAKO Renderer: present diagnostics: "
+                                 "operation=swapchain-recreation-observed"
+                              << " context=" << *presentingContextId
+                              << " role=" << layerRoleName
+                              << " swapchain=" << swapchain
+                              << " source=upstream-or-driver\n";
+                }
+
+                result = e.error();
+            } catch (const std::exception& e) {
+                std::cerr << "MAKO Renderer: swapchain presentation failed:\n";
+                std::cerr << "- " << e.what() << '\n';
+                result = VK_ERROR_UNKNOWN;
+            }
+
+            if (result != VK_SUCCESS && info->pResults)
+                info->pResults[i] = result;
+
+            if (result == VK_ERROR_OUT_OF_DATE_KHR)
+                swapchainOutOfDate = true;
+        }
+
+        collectRetiredSwapchainsAfterPresent(queue, *info);
+
+        // Preserve a genuine game/driver out-of-date result, or MAKO's guarded
+        // one-shot live-scaling recreation request, across the present batch.
+        return swapchainOutOfDate ? VK_ERROR_OUT_OF_DATE_KHR : result;
+#pragma clang diagnostic pop
+    }
+
+    VkResult bridgeAcquisitionResult(const VkSwapchainKHR swapchain) {
+        if (!instance_info->scalingSurfaces)
+            return VK_SUCCESS;
+        const auto info = instance_info->swapchainInfos.find(swapchain);
+        return info == instance_info->swapchainInfos.end() ? VK_SUCCESS
+            : instance_info->scalingSurfaces->acquisitionResult(
+                info->second.surface, swapchain);
+    }
+
+    VkResult myvkAcquireNextImageKHR(
+            VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+            VkSemaphore semaphore, VkFence fence, uint32_t* imageIndex) {
+        IndependentRealPresent* indepPtr = nullptr;
+        bool knownSwap = false;
+        {
+            const std::shared_lock regLock(registryMutex());
+            knownSwap = instance_info->swapchains.contains(swapchain);
+            if (knownSwap) {
+                const auto independent = instance_info->independentRealSwapchains.find(swapchain);
+                if (independent != instance_info->independentRealSwapchains.end())
+                    indepPtr = independent->second.get();
+            }
+        }
+        if (!knownSwap)
+            return VK_ERROR_INITIALIZATION_FAILED;
+        if (indepPtr) {
+            const VkAcquireNextImageInfoKHR request{.sType = VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR,
+                .swapchain = swapchain, .timeout = timeout, .semaphore = semaphore, .fence = fence, .deviceMask = 1};
+            const auto result = indepPtr->acquire(request, imageIndex, false);
+            if (result == VK_ERROR_OUT_OF_DATE_KHR && indepPtr->workerFailed())
+                rejectIndependentPresentation(*indepPtr);
+            return result;
+        }
+        const auto mapping = instance_info->swapchains.find(swapchain);
+
+        const auto extentResult = bridgeAcquisitionResult(swapchain);
+        if (extentResult != VK_SUCCESS)
+            return extentResult;
+        return present_diagnostics::observeApplicationAcquire(
+            device, swapchain, present_diagnostics::ApplicationFrameApi::AcquireKhr,
+            timeout, [&] {
+                return acquireWithinApplicationBudget(swapchain, timeout, [&] {
+                    return timeApplicationAcquire(swapchain, [&] {
+                        return mapping->second.get().df().AcquireNextImageKHR(
+                            device, swapchain, timeout, semaphore, fence,
+                            imageIndex);
+                    });
+                });
+            });
+    }
+
+    VkResult myvkAcquireNextImage2KHR(VkDevice device,
+            const VkAcquireNextImageInfoKHR* info, uint32_t* imageIndex) {
+        if (!instance_info || !info)
+            return VK_ERROR_INITIALIZATION_FAILED;
+        IndependentRealPresent* indepPtr = nullptr;
+        bool knownSwap = false;
+        {
+            const std::shared_lock regLock(registryMutex());
+            knownSwap = instance_info->swapchains.contains(info->swapchain);
+            if (knownSwap) {
+                const auto independent = instance_info->independentRealSwapchains.find(info->swapchain);
+                if (independent != instance_info->independentRealSwapchains.end())
+                    indepPtr = independent->second.get();
+            }
+        }
+        if (!knownSwap)
+            return VK_ERROR_INITIALIZATION_FAILED;
+        if (indepPtr) {
+            const auto result = indepPtr->acquire(*info, imageIndex, true);
+            if (result == VK_ERROR_OUT_OF_DATE_KHR && indepPtr->workerFailed())
+                rejectIndependentPresentation(*indepPtr);
+            return result;
+        }
+        const auto mapping = instance_info->swapchains.find(info->swapchain);
+        const auto lower = mapping->second.get().df().AcquireNextImage2KHR;
+        if (!lower)
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        const auto extentResult = bridgeAcquisitionResult(info->swapchain);
+        if (extentResult != VK_SUCCESS)
+            return extentResult;
+        return present_diagnostics::observeApplicationAcquire(
+            device, info->swapchain, present_diagnostics::ApplicationFrameApi::AcquireKhr2,
+            info->timeout, [&] {
+                return acquireWithinApplicationBudget(info->swapchain,
+                        info->timeout, [&] {
+                    return timeApplicationAcquire(info->swapchain, [&] {
+                        return lower(device, info, imageIndex);
+                    });
+                });
+            });
+    }
+
+    void myvkDestroySwapchainKHR(
+            VkDevice device,
+            VkSwapchainKHR swapchain,
+            const VkAllocationCallbacks* alloc) {
+        const std::lock_guard lifeLock(lifecycleMutex());
+        std::unique_ptr<IndependentRealPresent> doomedIndep;
+        {
+            std::unique_lock regLock(registryMutex());
+            if (!instance_info || !instance_info->devices.contains(device))
+                return;
+            if (auto foundInd = instance_info->independentRealSwapchains.find(swapchain);
+                    foundInd != instance_info->independentRealSwapchains.end()) {
+                doomedIndep = std::move(foundInd->second);
+                instance_info->independentRealSwapchains.erase(foundInd);
+                instance_info->swapchains.erase(swapchain);
+                regLock.unlock();
+                doomedIndep.reset();
+                return;
+            }
+        }
+        const auto& it = instance_info->devices.find(device);
+        {
+            const std::lock_guard retirementLock(
+                instance_info->retiredSwapchainsMutex
+            );
+            if (instance_info->retiredSwapchains.contains(swapchain)) {
+                std::cerr << "MAKO Renderer: duplicate deferred swapchain "
+                             "destruction ignored\n";
+                return;
+            }
+        }
+
+        const auto swapchainMetadata =
+            instance_info->swapchainInfos.find(swapchain);
+        const VkSurfaceKHR surface = swapchainMetadata ==
+                instance_info->swapchainInfos.end()
+            ? VK_NULL_HANDLE
+            : swapchainMetadata->second.surface;
+        const bool native =
+            instance_info->nativeSwapchains.contains(swapchain);
+        if (instance_info->scalingSurfaces) {
+            instance_info->scalingSurfaces->destroySwapchain(
+                surface, swapchain
+            );
+        }
+        if (present_diagnostics::enabled()) {
+            std::cerr << "MAKO Renderer: present diagnostics: "
+                         "operation=swapchain-destroy-observed"
+                      << " role=" << layerRoleName
+                      << " swapchain=" << swapchain
+                      << " surface=" << surface
+                      << " allocation_callbacks=" << (alloc ? 1 : 0)
+                      << '\n';
+        }
+        auto context = layer_info->root.takeSwapchainContext(swapchain);
+        instance_info->swapchainInfos.erase(swapchain);
+        instance_info->swapchains.erase(swapchain);
+        {
+            const std::lock_guard lock(instance_info->acquireBudgetsMutex);
+            const auto budget = instance_info->acquireBudgets.find(swapchain);
+            if (budget != instance_info->acquireBudgets.end()) {
+                budget->second->close();
+                instance_info->acquireBudgets.erase(budget);
+                instance_info->acquireBudgetsPresent.store(
+                    !instance_info->acquireBudgets.empty(),
+                    std::memory_order_release);
+            }
+        }
+        instance_info->nativeSwapchains.erase(swapchain);
+
+        if (!native && context && context->presentRetirementEnabled()) {
+            if (!alloc) {
+                const auto now = std::chrono::steady_clock::now();
+                bool inserted = false;
+                size_t pending = 0;
+                {
+                    const std::lock_guard retirementLock(
+                        instance_info->retiredSwapchainsMutex
+                    );
+                    inserted = instance_info->retiredSwapchains.emplace(
+                            swapchain,
+                            InstanceInfo::RetiredSwapchain{
+                                .device = device,
+                                .surface = surface,
+                                .vk = ls::R<vk::Vulkan>(it->second),
+                                .context = std::move(context),
+                                .notBefore = now + swapchainRetirementGracePeriod,
+                            }
+                        ).second;
+                    if (inserted) {
+                        instance_info->retiredSwapchainCount.fetch_add(
+                            1, std::memory_order_release
+                        );
+                    }
+                    pending = instance_info->retiredSwapchains.size();
+                }
+                if (!inserted) {
+                    std::cerr << "MAKO Renderer: duplicate deferred swapchain "
+                                 "retirement ignored\n";
+                    return;
+                }
+                if (present_diagnostics::enabled()) {
+                    std::cerr << "MAKO Renderer: present diagnostics: "
+                                 "operation=swapchain-retirement-deferred"
+                              << " role=" << layerRoleName
+                              << " swapchain=" << swapchain
+                              << " reason=await-later-present-and-fence"
+                              << " grace_ms="
+                              << swapchainRetirementGracePeriod.count()
+                              << " pending="
+                              << pending
+                              << '\n';
+                }
+                return;
+            }
+        }
+
+        // A custom allocator cannot be retained because its pUserData lifetime
+        // ends with this call. The same synchronous wait also covers
+        // layer-owned fences recorded before an upstream present-fence owner
+        // was observed. A valid owner has already made this wait immediately
+        // satisfiable before requesting destruction.
+        if (context && !context->waitForPresentRetirement(
+                it->second, UINT64_MAX)) {
+            std::cerr << "MAKO Renderer: synchronous swapchain retirement "
+                         "failed; forwarding lower destruction without a "
+                         "completed layer-owned fence\n";
+        }
+        context.reset();
+        it->second.df().DestroySwapchainKHR(device, swapchain, alloc);
+    }
+}
+
+namespace {
+    bool initializeLayerInfo() {
+        if (layer_info) return true;
+
+        try {
+            layer_info = new LayerInfo { // NOLINT (memory management)
+                .map = {
+#define VKPTR(name) reinterpret_cast<PFN_vkVoidFunction>(name)
+                    { "vkCreateInstance", VKPTR(myvkCreateInstance) },
+                    { "vkCreateDevice", VKPTR(myvkCreateDevice) },
+                    { "vkEnumerateDeviceExtensionProperties", VKPTR(myvkEnumerateDeviceExtensionProperties) },
+                    { "vkSetHdrMetadataEXT", VKPTR(myvkSetHdrMetadataEXT) },
+                    { "vkGetPhysicalDeviceFeatures2", VKPTR(myvkGetPhysicalDeviceFeatures2) },
+                    { "vkGetPhysicalDeviceFeatures2KHR", VKPTR(myvkGetPhysicalDeviceFeatures2) },
+                    { "vkDestroyDevice", VKPTR(myvkDestroyDevice) },
+                    { "vkDestroyInstance", VKPTR(myvkDestroyInstance) },
+                    { "vkCreateWaylandSurfaceKHR",
+                        VKPTR(myvkCreateWaylandSurfaceKHR) },
+                    { "vkCreateXcbSurfaceKHR",
+                        VKPTR(myvkCreateXcbSurfaceKHR) },
+                    { "vkCreateXlibSurfaceKHR",
+                        VKPTR(myvkCreateXlibSurfaceKHR) },
+                    { "vkDestroySurfaceKHR", VKPTR(myvkDestroySurfaceKHR) },
+                    { "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+                        VKPTR(myvkGetPhysicalDeviceSurfaceCapabilitiesKHR) },
+                    { "vkGetPhysicalDeviceSurfaceCapabilities2KHR",
+                        VKPTR(myvkGetPhysicalDeviceSurfaceCapabilities2KHR) },
+                    { "vkGetPhysicalDeviceSurfaceFormatsKHR",
+                        VKPTR(myvkGetPhysicalDeviceSurfaceFormatsKHR) },
+                    { "vkGetPhysicalDeviceSurfaceFormats2KHR",
+                        VKPTR(myvkGetPhysicalDeviceSurfaceFormats2KHR) },
+                    { "vkCreateSwapchainKHR", VKPTR(myvkCreateSwapchainKHR) },
+                    { "vkAcquireNextImageKHR", VKPTR(myvkAcquireNextImageKHR) },
+                    { "vkAcquireNextImage2KHR", VKPTR(myvkAcquireNextImage2KHR) },
+                    { "vkQueuePresentKHR", VKPTR(myvkQueuePresentKHR) },
+                    { "vkWaitForPresentKHR", VKPTR(myvkWaitForPresentKHR) },
+#if defined(VK_KHR_present_wait2)
+                    { "vkWaitForPresent2KHR", VKPTR(myvkWaitForPresent2KHR) },
+#endif
+                    { "vkDestroySwapchainKHR", VKPTR(myvkDestroySwapchainKHR) }
+#undef VKPTR
+                },
+                .root = Root()
+            };
+
+        } catch (const std::exception& e) {
+            std::cerr << "MAKO Renderer: layer initialization failed:\n";
+            std::cerr << "- " << e.what() << '\n';
+            return false;
+        }
+
+        return true;
+    }
+}
+
+// Interface-version negotiation is the modern layer ABI. Keep the traditional
+// proc-address exports as a compatibility path for older loaders.
+__attribute__((visibility("default")))
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(
+        VkInstance instance, const char* name) {
+    return myvkGetInstanceProcAddr(instance, name);
+}
+
+__attribute__((visibility("default")))
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(
+        VkDevice device, const char* name) {
+    return myvkGetDeviceProcAddr(device, name);
+}
+
+/// Vulkan layer entrypoint
+__attribute__((visibility("default")))
+VKAPI_ATTR VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(
+        VkNegotiateLayerInterface* pVersionStruct) {
+    // ensure loader compatibility
+    if (!pVersionStruct
+        || pVersionStruct->sType != LAYER_NEGOTIATE_INTERFACE_STRUCT
+        || pVersionStruct->loaderLayerInterfaceVersion < 2)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    const std::lock_guard lifeLock(lifecycleMutex());
+    // if the layer has already been initialized, skip
+    if (layer_info) {
+        pVersionStruct->loaderLayerInterfaceVersion = 2;
+        pVersionStruct->pfnGetPhysicalDeviceProcAddr = nullptr;
+        pVersionStruct->pfnGetDeviceProcAddr = myvkGetDeviceProcAddr;
+        pVersionStruct->pfnGetInstanceProcAddr = myvkGetInstanceProcAddr;
+        return VK_SUCCESS;
+    }
+
+    // load the layer configuration
+    if (!initializeLayerInfo())
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    // emplace function pointers/version
+    pVersionStruct->loaderLayerInterfaceVersion = 2;
+    pVersionStruct->pfnGetPhysicalDeviceProcAddr = nullptr;
+    pVersionStruct->pfnGetDeviceProcAddr = myvkGetDeviceProcAddr;
+    pVersionStruct->pfnGetInstanceProcAddr = myvkGetInstanceProcAddr;
+    return VK_SUCCESS;
+}

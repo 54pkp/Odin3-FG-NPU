@@ -1,0 +1,686 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+#pragma once
+
+#include "mako-backend/mako.hpp"
+#include "mako-common/configuration/config.hpp"
+#include "mako-common/helpers/pointers.hpp"
+#include "mako-common/vulkan/command_buffer.hpp"
+#include "mako-common/vulkan/fence.hpp"
+#include "mako-common/vulkan/image.hpp"
+#include "mako-common/vulkan/semaphore.hpp"
+#include "mako-common/vulkan/timeline_semaphore.hpp"
+#include "mako-common/vulkan/vulkan.hpp"
+#include "adaptive_scheduler.hpp"
+#include "color_pipeline.hpp"
+#include "generated_frame_delivery.hpp"
+#include "profile_update.hpp"
+#include "presentation_policy.hpp"
+#include "present_diagnostics.hpp"
+#include "runtime_status.hpp"
+#include "runtime_health.hpp"
+#include "runtime_transition.hpp"
+#include "spatial_scaler.hpp"
+#include "spatial_scaling_policy.hpp"
+#include "spatial_command_recording.hpp"
+#include "present_timing.hpp"
+#include "frame_recorder.hpp"
+
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <vulkan/vulkan_core.h>
+
+namespace mako::layer {
+
+    class GamescopeScalingSurface;
+
+    /// swapchain info struct
+    struct SwapchainInfo {
+        std::vector<VkImage> images;
+        VkSurfaceKHR surface;
+        // Borrowed from the instance owner, whose surface and connection
+        // outlive Vulkan swapchain retirement. Null for ordinary/WSI surfaces.
+        GamescopeScalingSurface* gamescopeScalingSurface{nullptr};
+        // Enabled only when the lower chain advertises display timing and the
+        // application has not selected its own timing-feedback namespace.
+        bool gamescopeDisplayTiming{false};
+        bool ownedPresentTiming{false};
+        // Any Gamescope signal at creation. Without one, a desktop compositor
+        // may need MAKO to space generated outputs itself.
+        bool gamescopeSession{false};
+        VkFormat format;
+        VkColorSpaceKHR colorSpace;
+        // Final usage of the lower images; test recordings need transfer reads.
+        VkImageUsageFlags imageUsage{0};
+        // Preserve the application's requested minimum separately from the
+        // bounded minimum forwarded by MAKO and the actual returned count in
+        // `images`. These values expose the selected launch policy and support
+        // generated-capacity admission without changing presentation behavior.
+        uint32_t requestedMinImageCount{0};
+        uint32_t provisionedMinImageCount{0};
+        bool swapchainImageCountCompatibility{false};
+        // Preserve whether the application supplied the Vulkan replacement
+        // lineage explicitly so retirement and replacement stabilization keep
+        // the game's ownership boundary.
+        bool applicationOldSwapchainProvided{false};
+        // Extent the application requested after MAKO virtualized fixed WSI
+        // capabilities. The actual swapchain images retain `extent`.
+        VkExtent2D applicationExtent;
+        VkExtent2D extent;
+        // Proven Gamescope output geometry used to cap ordinary scaling and
+        // to expose the live non-supersampling slider ceiling.
+        std::optional<VkExtent2D> gamescopePresentationTarget;
+        // Preserve the incoming application's or upper layer's request before
+        // MAKO selects its immutable lower/compositor transport contract.
+        VkPresentModeKHR incomingPresentMode{VK_PRESENT_MODE_FIFO_KHR};
+        VkPresentModeKHR presentMode;
+        // Persist the exact create-time transport decision. HDR feedback can
+        // change later, but Vulkan present mode/pNext compatibility cannot be
+        // reinterpreted without replacing the game-owned swapchain.
+        bool privateOrderedTransport{false};
+        // Frame generation cannot reach the screen through this surface, so
+        // it stays off whatever the colour pipeline later allows.
+        bool frameGenerationSurfaceUnavailable{false};
+        bool spatialScalingActive{false};
+        // Requested internal native output resize, including a memory-rejected
+        // candidate eligible for retry; the saved Scaling toggle stays off.
+        bool bridgeDisplayResize{false};
+        // Variable WSI surfaces retain the source extent and select a larger
+        // lower presentation envelope. Factor edits which remain above an
+        // already active ceiling can therefore be applied without replacing
+        // the game-owned swapchain.
+        bool variableSurface{false};
+        // True when scaling remains active at a lower effective factor because
+        // the requested presentation extent exceeded the create-time memory
+        // admission envelope.
+        bool spatialScalingMemoryConstrained{false};
+        // A replacement resolution change was rejected only by live memory
+        // admission while remaining inside the previous scaled envelope.
+        // One delayed, surface-budgeted retry may re-sample the driver.
+        bool spatialScalingAdmissionRetryEligible{false};
+        uint64_t spatialScalingPolicyRevision{0};
+        // Exact create-time reason for retaining native geometry. Keep this
+        // independent from activation support: memory and output-headroom
+        // guards are actionable on an otherwise supported surface.
+        SpatialScalingInactiveReason spatialScalingInactiveReason{
+            SpatialScalingInactiveReason::None
+        };
+        // False only when the lower split role proved that Gamescope WSI did
+        // not own this surface. No live factor can make that surface safe, so
+        // scaler choices remain dormant until a natural surface boundary.
+        bool spatialScalingActivationSupported{true};
+        // The upper WSI either supplied a live oldSwapchain handle or MAKO
+        // completed retirement of the exact retained lower handle before a
+        // null-old destroy-before-create replacement. This is a known
+        // owner-driven replacement rather than a cold process start, so
+        // Adaptive may use its bounded recovery guard.
+        bool replacement{false};
+        // Zink receives an application acquire window on this swapchain. Its
+        // worker-thread presents also read private acquire waits as FIFO
+        // backlog evidence; every other engine keeps ordinary pacing.
+        bool applicationAcquireWindow{false};
+    };
+
+    /// modify the swapchain create info based on the profile pre-swapchain creation
+    /// @param profile active game profile
+    /// @param maxImages maximum number of images supported by the surface
+    /// @param createInfo swapchain create info to modify
+    [[nodiscard]] bool context_ModifySwapchainCreateInfo(
+        const ls::GameConf& profile, uint32_t maxImages,
+        VkSwapchainCreateInfoKHR& createInfo, bool gamescopeHdrActive,
+        bool gamescopeDetected,
+        const PresentationEnvironmentPolicy& presentationEnvironment,
+        bool frameGenerationInteropEnabled,
+        bool spatialScalingActive,
+        bool directSpatialOutput = false);
+
+    /// swapchain context for a layer instance
+    class Swapchain {
+    public:
+        /// create a new swapchain context
+        /// @param vk vulkan instance
+        /// @param backend optional MAKO frame-generation backend; scaling is
+        /// independent and remains available when this is null
+        /// @param profile active game profile
+        /// @param info swapchain info
+        Swapchain(const vk::Vulkan& vk, backend::Instance* backend,
+            ls::GameConf profile, SwapchainInfo info,
+            std::optional<std::filesystem::path> scalingShaderDll,
+            bool fp16Requested,
+            std::optional<bool> gamescopeHdrActive,
+            bool gamescopeDetected, bool hdrExposureDisabled,
+            std::optional<uint32_t> gamescopeRefreshHz,
+            GamescopePresentationFeedback gamescopePresentationFeedback,
+            uint64_t runtimeStateRevision,
+            bool swapchainMaintenance1Enabled);
+
+        [[nodiscard]] bool needsGpuLoadMonitor() const {
+            return this->profile.gpu_headroom_percent > 0 &&
+                this->profile.frame_generation_enabled && this->instance &&
+                !this->gpuLoadMonitorInitialized;
+        }
+        void setGpuLoadMonitor(std::shared_ptr<present_diagnostics::GpuLoadMonitor> monitor) {
+            this->gpuLoadMonitor = std::move(monitor);
+            // An unavailable device or failed setup must not retry every frame.
+            this->gpuLoadMonitorInitialized = true;
+        }
+
+        /// present a frame
+        /// @param vk vulkan instance
+        /// @param queue presentation queue
+        /// @param next_chain next chain pointer for the present info (WARN: shared!)
+        /// @param imageIdx swapchain image index to present to
+        /// @param semaphores semaphores to wait on before presenting
+        /// @throws ls::vulkan_error on vulkan errors
+        VkResult present(const vk::Vulkan& vk,
+            VkQueue queue, VkSwapchainKHR swapchain,
+            void* next_chain, uint32_t imageIdx,
+            std::span<const VkSemaphore> semaphores);
+        /// Share of the previous source interval the application spent in
+        /// MAKO's acquire and present calls, or unknown when not observed.
+        void observeApplicationLayerShare(std::optional<double> share) {
+            this->applicationLayerShare = share;
+        }
+        /// stable identifier used to correlate this context's diagnostics
+        [[nodiscard]] uint64_t diagnosticsId() const {
+            return this->diagnosticsState.contextId;
+        }
+        [[nodiscard]] bool spatialScalingActive() const {
+            return this->spatialScaler.has_value();
+        }
+        [[nodiscard]] VkExtent2D frameGenerationResourceExtent() const {
+            return frameGenerationExtent(
+                this->spatialFramePipelinePlacement,
+                this->info.applicationExtent, this->info.extent
+            );
+        }
+        [[nodiscard]] SpatialFramePipelinePlacement
+        framePipelinePlacement() const {
+            return this->spatialFramePipelinePlacement;
+        }
+
+        /// Apply configuration that is safe for an already-created context.
+        /// Spatial model and sharpness changes rebuild MAKO's private scaler
+        /// at the next presentation boundary. The lower managed spatial role
+        /// may request one game-owned recreation for an extent change after a
+        /// retirement-fenced present; unsupported resource-shape changes wait
+        /// for a natural recreation. Process-wide backend changes wait for
+        /// restart. The decision reports every applied and pending boundary.
+        [[nodiscard]] ProfileUpdateDecision updateProfile(
+            const ls::GameConf& profile, uint64_t runtimeStateRevision,
+            const ls::GameConf* requestedProfile = nullptr,
+            bool processRestartPending = false);
+
+        /// After the lower WSI has consumed this present's wait semaphores,
+        /// convert one successful result into VK_ERROR_OUT_OF_DATE_KHR for a
+        /// pending live profile-resource change. The application remains the
+        /// owner of destruction and recreation.
+        [[nodiscard]] bool requestLiveProfileResourceRecreationAfterPresent(
+            VkResult lowerPresentResult);
+
+        /// Re-sample a transient live-memory rejection once after a bounded
+        /// settling period. The entrypoint owns the per-surface episode budget.
+        [[nodiscard]] bool requestSpatialScalingAdmissionRetryAfterPresent(
+            VkResult lowerPresentResult, bool surfaceRequestAvailable);
+
+        /// Escalate persistent generated-image starvation after a confirmed
+        /// menu return. This is shared by Fixed and Adaptive policies.
+        [[nodiscard]] bool requestOrderedAcquireRecreationAfterPresent(
+            VkResult lowerPresentResult, bool surfaceRequestAvailable);
+
+        /// Wait for every layer-owned maintenance1 present fence associated
+        /// with this swapchain. A zero timeout is a nonblocking retirement
+        /// poll that also requires idle backend and application-device work
+        /// before context destruction; finite waits are used only at
+        /// application destruction.
+        [[nodiscard]] bool waitForPresentRetirement(
+            const vk::Vulkan& vk, uint64_t timeoutNs);
+        [[nodiscard]] bool presentRetirementEnabled() const {
+            return !this->presentRetirementFences.empty();
+        }
+        /// Record a confirmed Gamescope application-HDR state change. Existing
+        /// contexts retain their safe encoding until the game naturally
+        /// recreates them.
+        [[nodiscard]] bool updateGamescopeHdrState(
+            bool active, uint64_t runtimeStateRevision);
+
+        /// Update the compositor scanout budget without rebuilding resources.
+        void updateGamescopeRefreshRate(std::optional<uint32_t> refreshHz);
+        void updateGamescopePresentationFeedback(
+            const GamescopePresentationFeedback& feedback);
+        void updateGamescopeFocus(const GamescopeFocusFeedback& focus) {
+            if (!this->gamescopeFocusInitialized) {
+                this->lastFocusReturnSequence = focus.returnSequence;
+                this->gamescopeFocusInitialized = true;
+            }
+            this->gamescopeFocus = focus;
+        }
+
+        /// Stop generation in place when the active profile disappears.
+        void disableFrameGeneration();
+    private:
+        /// present one real frame after any test-recording copy
+        VkResult presentFrame(const vk::Vulkan& vk,
+            VkQueue queue, VkSwapchainKHR swapchain,
+            void* next_chain, uint32_t imageIdx,
+            std::span<const VkSemaphore> semaphores);
+        void applyGamescopeFocus(std::chrono::steady_clock::time_point now);
+        GamescopeFocusFeedback gamescopeFocus;
+        GenerationPolicyResetGate generationPolicyResetGate;
+        bool steamMenuSuspended{false};
+        bool gamescopeFocusInitialized{false};
+        uint64_t lastFocusReturnSequence{0};
+        std::optional<bool> lastReportedGameFocus;
+        bool focusReported{false};
+        // Shared construction/replacement support; no independent resource owner.
+        [[nodiscard]] static bool directSpatialFrameGenerationOutputSupported(
+            const vk::Vulkan& vk, VkFormat format,
+            SpatialFramePipelinePlacement placement, bool spatialScalingActive);
+        [[nodiscard]] static SwapchainColorPipeline initialColorPipeline(
+            VkFormat format, VkColorSpaceKHR colorSpace,
+            std::optional<bool> gamescopeHdrActive, bool gamescopeDetected,
+            bool hdrExposureDisabled, bool frameGenerationSurfaceUnavailable);
+        /// Apply this surface's own frame-generation limit to a classified pipeline.
+        [[nodiscard]] static SwapchainColorPipeline surfaceColorPipeline(
+            SwapchainColorPipeline pipeline, bool frameGenerationSurfaceUnavailable);
+        static void selectPackedHdr10Transport(const vk::Vulkan& vk,
+            backend::Instance& backendInstance, SwapchainColorPipeline& pipeline,
+            bool& applicationSupported, bool& backendSupported);
+
+        struct PresentInvocation {
+            const vk::Vulkan& vk;
+            VkQueue queue;
+            VkSwapchainKHR swapchain;
+            const void* nextChain;
+            uint32_t imageIndex;
+            std::span<const VkSemaphore> waitSemaphores;
+            std::chrono::steady_clock::time_point cadenceStarted;
+            mutable std::chrono::steady_clock::time_point started;
+            // Fractional may spend the existing cap wait preparing generated
+            // outputs. Every real-frame/fallback path retains this deadline.
+            std::optional<std::chrono::steady_clock::time_point>
+                originalPresentDeadline;
+            std::optional<RealFramePacer::OutputBatch> pacedOutputs;
+
+            void waitForOutput(std::chrono::steady_clock::time_point deadline) const;
+        };
+
+        struct PresentationFramePlan {
+            // Policy request before WSI admission. Fully admitted timestamps
+            // remain authoritative through backend submission.
+            GeneratedFramePlan requestedGeneratedFrames;
+            // Executable plan after transport-specific admission. Gamescope HDR
+            // and headroom-tight ordered SDR may contain fewer, deliberately
+            // re-spaced timestamps.
+            GeneratedFramePlan scheduledGeneratedFrames;
+            size_t admittedGeneratedFrameCount{0};
+            bool historyWarmupActive{false};
+            bool generatedImagesPreacquired{false};
+            // Fixed refresh retains zero-wait sequential acquire. Requested
+            // VRR uses a finite application-present ceiling, then zero-wait
+            // pressure preflight. One enum prevents contradictory modes.
+            AdaptiveOrderedDeliveryPolicy adaptiveOrderedDeliveryPolicy{
+                AdaptiveOrderedDeliveryPolicy::NotApplicable
+            };
+            // Recovery probes are transport-owned synthetic delivery. Keep
+            // them out of Adaptive ramp and Smooth Cadence qualification even
+            // when an isolated guard clears before delivery is reported.
+            bool orderedAcquireRecoveryProbe{false};
+            bool boundedOrderedAcquireProbe{false};
+            std::optional<uint64_t> configuredAcquireTimeout;
+            // Opt-in diagnostic phase accounting stays inline with the frame
+            // plan so a slow total can expose multiple sub-threshold waits
+            // without allocating or emitting one record per phase.
+            std::chrono::steady_clock::duration renderFenceWaitDuration{};
+            std::chrono::steady_clock::duration preacquireDuration{};
+            std::chrono::steady_clock::duration scheduleFramesDuration{};
+            std::chrono::steady_clock::duration submitSourceCopyDuration{};
+            std::array<uint32_t, GeneratedFramePlan::capacity>
+                preacquiredGeneratedImages{};
+        };
+
+        struct FrameState {
+            size_t sequenceIndex{1};
+            // The backend timeline is reset only when MAKO commits a new
+            // private context. Diagnostics and binary-semaphore ring indices
+            // remain monotonic across that transition.
+            size_t backendTimelineIndex{1};
+            size_t realFrameIndex{0};
+            size_t backendFrameIndex{0};
+            bool renderFenceInFlight{false};
+            // The cadence time of the last real frame the backend accepted.
+            // MAKO FG reuses motion only while the intervals between these
+            // stay even; a new context starts without one.
+            std::optional<std::chrono::steady_clock::time_point>
+                backendSourceCadence;
+
+            [[nodiscard]] std::chrono::nanoseconds backendSourceInterval(
+                    const std::chrono::steady_clock::time_point cadence) const {
+                if (!this->backendSourceCadence ||
+                        cadence <= *this->backendSourceCadence)
+                    return {};
+                return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    cadence - *this->backendSourceCadence
+                );
+            }
+        };
+
+        struct RecoveryState {
+            GeneratedImageAdmission generatedImageAdmission;
+            OrderedAcquireRecovery orderedAcquireRecovery;
+            PipelineBusyRecovery pipelineBusyRecovery;
+            ReplacementBackendStabilization replacementBackendStabilization;
+            bool backendPending{false};
+            uint64_t htpVfiOutputPending{0};
+            uint64_t htpVfiSourceReuseValue{0};
+            bool htpVfiWorkerStopped{false};
+            std::optional<std::chrono::steady_clock::time_point> lostBackendRetryAt;
+            bool lostBackendStopped{false};
+            uint32_t lostBackendFailures{0};
+            size_t historyWarmupRemaining{0};
+        };
+
+        struct DiagnosticsState {
+            std::optional<std::chrono::steady_clock::time_point>
+                fixedWindowStarted;
+            size_t fixedRealFrames{0};
+            size_t fixedGeneratedFrames{0};
+            size_t fixedSkippedFrames{0};
+            uint64_t contextId{0};
+            bool orderedAcquireClassificationSplitLogged{false};
+            bool orderedGeneratedAdmissionPolicyLogged{false};
+            std::optional<present_diagnostics::ApplicationPresentMode>
+                applicationPresentMode;
+        };
+
+        struct ColorTransitionState {
+            std::optional<bool> pendingGamescopeHdrActive;
+            uint64_t pendingHdrStateRevision{0};
+            std::optional<std::chrono::steady_clock::time_point> retryAt;
+        };
+
+        struct SpatialResourceRequest {
+            ls::ScalingMethod method{ls::ScalingMethod::Native};
+            float sharpness{0.5F};
+            ls::HdrQuality hdrQuality{ls::HdrQuality::Quality};
+
+            friend bool operator==(
+                    const SpatialResourceRequest& left,
+                    const SpatialResourceRequest& right) {
+                return left.method == right.method &&
+                    left.sharpness == right.sharpness &&
+                    ls::hdrCompactBuffers(left.hdrQuality) == ls::hdrCompactBuffers(right.hdrQuality);
+            }
+        };
+
+        struct FrameGenerationResourceRequest {
+            ls::GameConf profile;
+
+            friend bool operator==(
+                    const FrameGenerationResourceRequest& left,
+                    const FrameGenerationResourceRequest& right) {
+                return frameGenerationContextSettings(left.profile) ==
+                        frameGenerationContextSettings(right.profile) &&
+                    generatedFrameCapacityForProfile(left.profile) ==
+                        generatedFrameCapacityForProfile(right.profile);
+            }
+        };
+
+        struct FrameGenerationResources {
+            bool hdrReducedPrecision{false};
+            // Context must be destroyed before the exported Vulkan resources
+            // it imports. Members are destroyed in reverse declaration order.
+            std::vector<vk::Image> sourceImages;
+            std::vector<vk::Image> destinationImages;
+            ls::lazy<vk::TimelineSemaphore> syncSemaphore;
+            ls::lazy<vk::TimelineSemaphore> htpVfiRenderBoundary;
+            ls::owned_ptr<ls::R<backend::Context>> context;
+        };
+
+        struct RuntimeStatusState {
+            ls::GameConf requestedProfile;
+            uint64_t stateRevision{0};
+            bool swapchainRecreationPending{false};
+            bool processRestartPending{false};
+            std::optional<std::string> error;
+        };
+
+        bool frameGenerationHdrReducedPrecision{false};
+        std::vector<vk::Image> sourceImages;
+        std::vector<vk::Image> destinationImages;
+        ls::lazy<vk::TimelineSemaphore> syncSemaphore;
+        ls::lazy<vk::TimelineSemaphore> htpVfiRenderBoundary;
+
+        ls::lazy<vk::CommandBuffer> renderCommandBuffer;
+        ls::lazy<vk::Fence> renderFence;
+        struct RenderPass {
+            vk::CommandBuffer commandBuffer;
+            vk::Semaphore acquireSemaphore;
+        };
+        std::vector<RenderPass> passes;
+        std::vector<std::pair<vk::Semaphore, vk::Semaphore>> postCopySemaphores;
+
+        struct SpatialScalingPass {
+            vk::CommandBuffer commandBuffer;
+            vk::Semaphore readySemaphore;
+            vk::Fence completionFence;
+            bool completionInFlight{false};
+            SpatialCommandRecording recording;
+        };
+        std::optional<SpatialScaler> spatialScaler;
+        // Test recordings of real frames (frame-generation layer only).
+        std::unique_ptr<FrameRecorder> frameRecorder;
+        std::optional<bool> shaderHdrReducedPrecision;
+        std::vector<SpatialScalingPass> spatialScalingPasses;
+        SpatialFramePipelinePlacement spatialFramePipelinePlacement{
+            SpatialFramePipelinePlacement::PreFrameGeneration
+        };
+
+        struct PresentRetirementFence {
+            vk::Fence fence;
+            bool associated{false};
+            bool used{false};
+        };
+        std::vector<PresentRetirementFence> presentRetirementFences;
+        bool lastLowerPresentRetirementProtected{false};
+        bool presentRetirementBusyLogged{false};
+        bool externalPresentFenceLogged{false};
+
+        backend::Instance* instance{nullptr};
+        ls::owned_ptr<ls::R<backend::Context>> ctx;
+        FrameState frameState;
+        RecoveryState recoveryState;
+        DiagnosticsState diagnosticsState;
+        ColorTransitionState colorTransitionState;
+        PrivateResourceTransition<SpatialResourceRequest> spatialTransition;
+        std::optional<SpatialScaler> preparedSpatialScaler;
+        PrivateResourceTransition<FrameGenerationResourceRequest>
+            frameGenerationTransition;
+        std::optional<FrameGenerationResources>
+            preparedFrameGenerationResources;
+        RuntimeStatusPublisher runtimeStatusPublisher;
+        RuntimeStatusState runtimeStatusState;
+        LiveProfileResourceRecreation liveProfileResourceRecreation;
+        std::optional<std::chrono::steady_clock::time_point>
+            spatialScalingAdmissionRetryAfter;
+        bool spatialScalingAdmissionRetrySignaled{false};
+        std::optional<AdaptiveScheduler> adaptiveScheduler;
+        // A partial native-first acquisition proves that this exact ordered
+        // WSI context cannot reliably deliver its larger automatic batch.
+        // Retain the observed lower ceiling until game-owned recreation.
+        std::optional<size_t> adaptiveOrderedWsiGeneratedCapacityLimit;
+        size_t configuredFixedGeneratedFrames{0};
+
+        bool gamescopeDetected{false};
+        // Immutable for this context; copied from SwapchainInfo rather than
+        // inferred again from the current SDR/HDR colour pipeline.
+        bool privateOrderedTransport{false};
+        std::optional<uint32_t> gamescopeRefreshHz;
+        GamescopePresentationFeedback gamescopePresentationFeedback;
+        FixedRefreshBudget fixedRefreshBudget;
+        RealFramePacer realFramePacer;
+        SourceIntervalOutputSpacing sourceIntervalSpacing;
+        std::shared_ptr<present_diagnostics::GpuLoadMonitor> gpuLoadMonitor;
+        bool gpuLoadMonitorInitialized{false};
+        GpuHeadroomController gpuHeadroom;
+        GpuHeadroomController::Result gpuHeadroomResult;
+        std::optional<std::chrono::steady_clock::time_point> lastGpuHeadroomDiagnostic;
+        // Actual scheduled batch, including the real image; never the user's
+        // unproven maximum multiplier. Reset before native/history fallbacks.
+        size_t bridgeOutputBatchSize{1};
+        std::optional<std::chrono::steady_clock::time_point> outputSourceDeadline;
+        // Last deadline scheduled by an owned output timeline. Recovery may
+        // sample native cadence only after this earlier queue has cleared.
+        std::optional<std::chrono::steady_clock::time_point> orderedPresentationDeadline;
+        std::optional<double> applicationLayerShare;
+        OrderedPresentTimeline wsiPresentTimeline;
+        OwnedPresentTiming presentTiming;
+        bool presentTimingInitialized{false};
+        PFN_vkGetPastPresentationTimingGOOGLE wsiPresentTimingQuery{nullptr};
+        uint32_t wsiTimingPresentsSinceDrain{0};
+        bool wsiPresentTimingLogged{false};
+        SmoothCadenceBaseCap smoothCadenceBaseCap;
+        SmoothCadencePacerHandoff smoothCadencePacerHandoff;
+        // Private generated-image acquire wait of the last generated present,
+        // consumed by the next present. Read only with an acquire window.
+        std::optional<std::chrono::steady_clock::duration> lastGeneratedAcquireWait;
+        CappedFifoBacklogDrain cappedFifoBacklogDrain;
+        // The implicit Zink cap at the last present, for its change record.
+        double zinkRefreshLimitedCap{};
+        // A null-old replacement loses the driver's explicit WSI lineage.
+        // Consume this exactly once before any private spatial submission.
+        bool replacementWsiPrimePending{false};
+
+        SwapchainColorPipeline colorPipeline;
+        bool hdrExposureDisabled{true};
+        std::optional<std::filesystem::path> scalingShaderDll;
+        bool fp16Requested{true};
+        ls::GameConf profile;
+        SwapchainInfo info;
+
+        [[nodiscard]] bool applyPendingColorPipeline(const vk::Vulkan& vk);
+        [[nodiscard]] bool applyPendingFrameGenerationResources(
+            const vk::Vulkan& vk);
+        void applyPendingSpatialScaler(const vk::Vulkan& vk);
+        void prepareSpatialScalingPass(const vk::Vulkan& vk,
+            SpatialScalingPass& pass);
+        void recordSpatialScalingPass(const vk::Vulkan& vk,
+            SpatialScalingPass& pass, VkImage applicationImage,
+            VkImage frameGenerationSource = VK_NULL_HANDLE);
+        void invalidateSpatialScalingRecordings() noexcept;
+        [[nodiscard]] bool spatialScalingPassesReady(
+            const vk::Vulkan& vk);
+        void configureDirectSpatialFrameGenerationOutputs(
+            const vk::Vulkan& vk, SpatialScaler& scaler,
+            std::span<const vk::Image> outputs,
+            std::string_view reason) noexcept;
+        void clearDirectSpatialFrameGenerationOutputs() noexcept;
+        /// Bind this swapchain's images for direct reconstruction when they
+        /// were created with storage usage; otherwise keep the copy.
+        void configureDirectSpatialPresentationOutputs(
+            const vk::Vulkan& vk, SpatialScaler& scaler,
+            std::string_view reason) noexcept;
+        void publishRuntimeStatus(std::string_view reason) noexcept;
+        [[nodiscard]] static std::optional<uint64_t>
+            generatedImageAcquireTimeoutNs();
+        void ensureFrameGenerationExecutionResources(const vk::Vulkan& vk);
+        [[nodiscard]] FrameGenerationResources buildFrameGenerationResources(
+            const vk::Vulkan& vk, const SwapchainColorPipeline& pipeline,
+            const ls::GameConf& resourceProfile);
+        void commitFrameGenerationResources(
+            FrameGenerationResources resources,
+            const ls::GameConf& resourceProfile,
+            std::string_view reason);
+        void rebuildPrivateResources(const vk::Vulkan& vk,
+            SwapchainColorPipeline pipeline,
+            const ls::GameConf& resourceProfile);
+        [[nodiscard]] bool resetGenerationScheduler(
+            std::chrono::steady_clock::time_point now,
+            std::string_view reason);
+
+        // Real-frame presentation and source history.
+        void recordPresentCadence(
+            std::chrono::steady_clock::time_point presentNow);
+        [[nodiscard]] VkResult presentNativeFrame(
+            const PresentInvocation& invocation);
+        [[nodiscard]] VkResult presentDirectApplicationFrame(
+            const PresentInvocation& invocation,
+            std::string_view healthSource = "native");
+        [[nodiscard]] VkResult presentSpatiallyScaledFrame(
+            const PresentInvocation& invocation);
+        [[nodiscard]] VkResult presentOriginalImage(
+            const PresentInvocation& invocation, VkSemaphore waitSemaphore,
+            const void* nextChain,
+            std::chrono::steady_clock::duration* duration = nullptr);
+        void submitSourceCopy(const PresentInvocation& invocation,
+            VkImage swapchainImage, const vk::Image& sourceImage,
+            uint64_t previousWorkerValue = 0);
+        [[nodiscard]] VkResult presentHistoryOnly(
+            const PresentInvocation& invocation,
+            const PresentationFramePlan& plan,
+            std::optional<uint64_t> scheduledSourceValue = std::nullopt);
+        [[nodiscard]] VkResult presentWithHtpVfiDeadline(
+            const PresentInvocation& invocation);
+
+        // Frame planning, resource readiness, and generated-image admission.
+        [[nodiscard]] bool recoverBackendIfReady(const vk::Vulkan& vk);
+        [[nodiscard]] bool recoverLostBackend(const vk::Vulkan& vk);
+        void ensureHistoryWarmup(bool restart = false);
+        [[nodiscard]] PresentationFramePlan prepareFramePlan(
+            std::chrono::steady_clock::time_point presentNow,
+            bool orderedAcquireRecoveryProbe,
+            std::optional<size_t> integerBaseCapGenerationLimit);
+        void reportAdaptiveDelivery(const PresentationFramePlan& plan,
+            size_t acceptedForPresentation);
+        [[nodiscard]] bool generationPipelineReady(
+            const vk::Vulkan& vk, bool gamescopeHdrTransport,
+            const PresentationFramePlan& plan,
+            std::chrono::steady_clock::time_point presentNow);
+        [[nodiscard]] bool prepareRenderFence(const vk::Vulkan& vk, bool poll = false);
+        void handleRenderFenceBudgetMiss(
+            const PresentationFramePlan& plan);
+        void preacquireGeneratedImages(
+            const PresentInvocation& invocation,
+            PresentationFramePlan& plan,
+            bool trackNonblockingAdmission,
+            bool classifyAdaptiveLoadFailure,
+            uint64_t acquireTimeout,
+            bool reportAvailableOnFullAdmission = true);
+        void handleGeneratedImageAdmissionPressure(
+            const PresentationFramePlan& plan,
+            size_t admittedGeneratedFrames,
+            bool logPressure,
+            bool retainPartialAdmissionCapacity,
+            bool classifyAdaptiveLoadFailure,
+            uint64_t acquireTimeoutNanoseconds,
+            const char* action);
+        void reportGeneratedImageAdmissionAvailable(
+            size_t requiredStableBatches = 1);
+
+        // Generated delivery and lower-swapchain retirement.
+        [[nodiscard]] VkResult presentGeneratedFrames(
+            const PresentInvocation& invocation,
+            const PresentationFramePlan& plan,
+            bool gamescopeHdrTransport);
+        [[nodiscard]] VkResult queuePresentWithRetirementFence(
+            const vk::Vulkan& vk, VkQueue queue,
+            const VkPresentInfoKHR& presentInfo);
+        VkResult retireAcquiredImagesAndPresent(const vk::Vulkan& vk,
+            VkQueue queue, VkSwapchainKHR swapchain, const void* nextChain,
+            uint32_t originalImageIndex,
+            std::span<const VkSemaphore> applicationWaitSemaphores,
+            std::span<const uint32_t> acquiredImageIndices,
+            VkImage originalImage);
+    };
+
+}

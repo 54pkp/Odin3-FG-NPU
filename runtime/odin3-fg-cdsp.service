@@ -1,0 +1,27 @@
+[Unit]
+Description=Odin 3 Frame Generation cDSP listener
+After=dev-fastrpc\x2dcdsp\x2dsecure.device
+ConditionPathExists=/dev/fastrpc-cdsp-secure
+
+[Service]
+Type=exec
+ExecStart=/var/lib/odin3-fg/cdsp/bin/cdsprpcd
+WorkingDirectory=/var/lib/odin3-fg/cdsp/firmware
+Environment=LD_LIBRARY_PATH=/var/lib/odin3-fg/cdsp/lib
+Environment=ADSP_LIBRARY_PATH=/var/lib/odin3-fg/cdsp/firmware
+Restart=on-failure
+RestartSec=3
+# FastRPC reports EBUSY if another listener already owns the root PD.
+RestartPreventExitStatus=32
+TimeoutStopSec=10
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_NICE CAP_IPC_LOCK
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,7 +1,22 @@
 {
-  "MAKO": {"url": "https://github.com/eugeniosegala/MAKO.git", "revision": "504611d42b73d33320456911e9bf92215dbb8cbf"},
-  "GSF_Kedavra": {"url": "https://github.com/wavessevaw/GSF_Kedavra.git", "revision": "b5818e5fd41fd7180aa3071e082b768c06807445"},
-  "Vulkan-Headers": {"url": "https://github.com/KhronosGroup/Vulkan-Headers.git", "revision": "c46850864f4661461b0f6cb9922c058ffea4915e"},
-  "vela": {"url": "https://github.com/54pkp/vela.git", "revision": "21691c731525f624b8e8e70cf735f37da5c5fffd"},
-  "anvil": {"url": "https://github.com/NihilDigit/anvil.git", "revision": "f701fd9b01b9fbb20822637b5d82cac626079e5f"}
+  "MAKO": {
+    "url": "https://github.com/eugeniosegala/MAKO.git",
+    "revision": "504611d42b73d33320456911e9bf92215dbb8cbf",
+    "license": "GPL-3.0-or-later"
+  },
+  "Vulkan-Headers": {
+    "url": "https://github.com/KhronosGroup/Vulkan-Headers.git",
+    "revision": "c46850864f4661461b0f6cb9922c058ffea4915e",
+    "license": "Apache-2.0"
+  },
+  "fastrpc": {
+    "url": "https://github.com/qualcomm/fastrpc.git",
+    "revision": "a56e9d4de3614a8d8f4b0e15ff561350c4b686e3",
+    "license": "BSD-3-Clause"
+  },
+  "libyaml": {
+    "url": "https://github.com/yaml/libyaml.git",
+    "revision": "2c891fc7a770e8ba2fec34fc6b545c672beb37e6",
+    "license": "MIT"
+  }
 }

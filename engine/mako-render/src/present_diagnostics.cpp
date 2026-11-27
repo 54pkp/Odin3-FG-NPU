@@ -1,0 +1,999 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+#include "present_diagnostics.hpp"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
+#include <sstream>
+#include <string_view>
+
+#include <unistd.h>
+#include <link.h>
+
+namespace mako::layer::present_diagnostics {
+SteamOverlayLibraries steamOverlayLibraries() {
+    SteamOverlayLibraries libraries;
+    dl_iterate_phdr([](dl_phdr_info* info, size_t, void* state) {
+        auto& loaded = *static_cast<SteamOverlayLibraries*>(state);
+        std::string_view name{info->dlpi_name ? info->dlpi_name : ""};
+        const auto slash = name.find_last_of('/');
+        if (slash != std::string_view::npos) name.remove_prefix(slash + 1);
+        loaded.hookLoaded |= name == "gameoverlayrenderer.so";
+        loaded.vulkanLoaded |= name == "steamoverlayvulkanlayer.so";
+        return 0;
+    }, &libraries);
+    return libraries;
+}
+
+void recordPresentPhaseTiming(const uint64_t context, const size_t frame,
+        const size_t sequence, const Clock::time_point finished,
+        const std::array<double, 9>& milliseconds) noexcept {
+    try {
+        thread_local PresentPhaseTiming observation;
+        thread_local const auto threadId = gettid();
+        const auto window = observation.observe(context, finished, milliseconds);
+        if (!window) return;
+        constexpr std::array<std::string_view, 9> names{
+            "total", "render_fence", "schedule", "source_copy", "acquire",
+            "generated_submit", "generated_present", "original_present", "unattributed"};
+        std::ostringstream line;
+        line << "MAKO Renderer: present diagnostics: operation=present-phase-summary"
+             << " context=" << context << " pid=" << getpid() << " tid=" << threadId
+             << " sample_end_monotonic_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(finished.time_since_epoch()).count()
+             << " calls=" << window->calls << " frame=" << frame << " sequence=" << sequence;
+        for (size_t index = 0; index < names.size(); ++index)
+            line << ' ' << names[index] << "_mean_ms=" << window->phases[index].mean()
+                 << ' ' << names[index] << "_max_ms=" << window->phases[index].maximum;
+        line << '\n';
+        std::cerr << line.str();
+    } catch (...) {}
+}
+
+void recordApplicationFrameTiming(const ApplicationFrameApi api, const uintptr_t caller,
+        const VkSwapchainKHR swapchain, const Clock::time_point started,
+        const Clock::time_point finished, const std::optional<VkResult> result,
+        const std::optional<uint64_t> timeout,
+        const std::optional<Clock::duration> configurationUpdate) {
+    thread_local std::array<ApplicationFrameTiming, 3> observations;
+    thread_local uint64_t streamId = allocateContextId();
+    thread_local const auto threadId = gettid();
+    const auto window = observations.at(static_cast<size_t>(api)).observe(
+        caller, swapchain, started, finished, result, timeout, configurationUpdate);
+    if (!window)
+        return;
+    const bool present = api == ApplicationFrameApi::Present;
+    std::ostringstream line;
+    line << "MAKO Renderer: present diagnostics: operation="
+         << (present ? "application-queue-present" : "application-acquire")
+         << " stream=" << streamId << " pid=" << getpid()
+         << " tid=" << threadId
+         << " sample_end_monotonic_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(finished.time_since_epoch()).count()
+         << (present ? " queue=" : " device=") << reinterpret_cast<void*>(caller)
+         << " swapchain=" << swapchain
+         << " api=" << (present ? "KHR" : api == ApplicationFrameApi::AcquireKhr ? "KHR" : "KHR2")
+         << " calls=" << window->calls
+         << " entry_interval_samples=" << window->entryInterval.count
+         << " entry_interval_mean_ms=" << window->entryInterval.mean()
+         << " entry_interval_max_ms=" << window->entryInterval.maximum
+         << " duration_mean_ms=" << window->duration.mean()
+         << " duration_max_ms=" << window->duration.maximum;
+    if (present) {
+        line << " includes_intentional_pacing=1"
+             << " configuration_update_samples=" << window->configurationUpdate.count
+             << " configuration_update_mean_ms=" << window->configurationUpdate.mean()
+             << " configuration_update_max_ms=" << window->configurationUpdate.maximum;
+    } else {
+        line << " successful=" << window->successful << " timeouts=" << window->timeouts
+             << " not_ready=" << window->notReady << " errors=" << window->errors
+             << " polls=" << window->polls;
+    }
+    line << '\n';
+    std::cerr << line.str();
+}
+
+ApplicationPresentScope::ApplicationPresentScope(const VkQueue queue,
+        const VkSwapchainKHR swapchain) : active(enabled()),
+        caller(reinterpret_cast<uintptr_t>(queue)), swapchain(swapchain) {
+    if (this->active)
+        this->started = Clock::now();
+}
+
+ApplicationPresentScope::~ApplicationPresentScope() {
+    if (!this->active)
+        return;
+    // Diagnostics must not turn a completed application present into an error
+    // while unwinding a presentation failure or a terminal allocation failure.
+    try {
+        recordApplicationFrameTiming(ApplicationFrameApi::Present, this->caller,
+            this->swapchain, this->started, Clock::now(), {}, {}, this->updateDuration);
+    } catch (...) {
+    }
+}
+
+void ApplicationPresentScope::configurationUpdateStarted() {
+    if (this->active)
+        this->updateStarted = Clock::now();
+}
+
+void ApplicationPresentScope::configurationUpdateFinished() {
+    if (this->active)
+        this->updateDuration = Clock::now() - this->updateStarted;
+}
+
+void logBridgeTiming(const uint64_t bridgeId, const VkSwapchainKHR swapchain,
+        const BridgePresentTiming::Window& window,
+        const size_t outstanding, const uint64_t refreshCycleNs,
+        const uint32_t timingVersion, const uint64_t refreshIntervalNs) {
+    std::ostringstream line;
+    line << "MAKO Renderer: present diagnostics: operation=gamescope-bridge-timing"
+         << " bridge=" << bridgeId << " pid=" << getpid()
+         << " swapchain=" << swapchain
+         << " timestamp_source=compositor-reported"
+         << " timing_protocol=" << timingVersion << " timestamp_kind=prediction"
+         << " requests=" << window.requests << " feedbacks=" << window.feedbacks
+         << " outstanding=" << outstanding << " unmatched=" << window.unmatched
+         << " overwritten=" << window.overwritten << " discontinuities=" << window.discontinuities
+         << " nonconsecutive_ids=" << window.nonconsecutiveIds
+         << " repeated_timestamps=" << window.repeatedTimestamps
+         << " backwards_timestamps=" << window.backwardsTimestamps
+         << " late_latch_feedbacks=" << window.lateLatchFeedbacks
+         << " dropped=" << window.dropped
+         << " invalid_stages=" << window.invalidStages
+         << " unavailable_stages=" << window.unavailableStages
+         << " queue_ready_samples=" << window.queueReady.count
+         << " queue_ready_mean_ms=" << window.queueReady.mean()
+         << " queue_ready_max_ms=" << window.queueReady.maximum
+         << " compositor_hold_samples=" << window.compositorHold.count
+         << " compositor_hold_mean_ms=" << window.compositorHold.mean()
+         << " compositor_hold_max_ms=" << window.compositorHold.maximum
+         << " requested_interval_samples=" << window.requestedInterval.count
+         << " requested_interval_mean_ms=" << window.requestedInterval.mean()
+         << " requested_interval_stddev_ms=" << window.requestedInterval.deviation()
+         << " requested_interval_max_ms=" << window.requestedInterval.maximum
+         << " reported_interval_samples=" << window.reportedInterval.count
+         << " reported_interval_mean_ms=" << window.reportedInterval.mean()
+         << " reported_interval_stddev_ms=" << window.reportedInterval.deviation()
+         << " reported_interval_max_ms=" << window.reportedInterval.maximum
+         << " lateness_mean_ms=" << window.lateness.mean()
+         << " lateness_max_ms=" << window.lateness.maximum
+         << " submit_lateness_mean_ms=" << window.submitLateness.mean()
+         << " submit_lateness_max_ms=" << window.submitLateness.maximum
+         << " refresh_cycle_ns=" << refreshCycleNs
+         << " refresh_interval_ns=" << refreshIntervalNs << '\n';
+    std::cerr << line.str();
+}
+
+bool bridgeFramesEnabled() {
+    static const bool value = [] {
+        const char* environment = std::getenv("MAKO_PRESENT_DIAGNOSTICS_BRIDGE_FRAMES");
+        return enabled() && environment && std::string_view(environment) != "0";
+    }();
+    return value;
+}
+
+void logBridgeFrame(const uint64_t bridgeId, const uint32_t timingVersion,
+        const BridgePresentTiming::Frame& frame) {
+    // One bounded write per output; feedback can be drained on the present thread.
+    const auto signedMs = [](const uint64_t later, const uint64_t earlier) {
+        if (!later || !earlier)
+            return 0.0;
+        return later >= earlier ? static_cast<double>(later - earlier) / 1000000.0
+                                : -static_cast<double>(earlier - later) / 1000000.0;
+    };
+    std::array<char, 512> line{};
+    const int length = std::snprintf(line.data(), line.size(),
+        "MAKO Renderer: present diagnostics: operation=gamescope-bridge-frame"
+        " bridge=%llu timing_protocol=%u id=%llu desired_ns=%llu planned_submit_ns=%llu"
+        " submitted_ns=%llu shown_ns=%llu latch_ns=%llu queue_end_ns=%llu"
+        " lateness_ms=%.3f slack_ms=%.3f late_latch=%d dropped=%d\n",
+        static_cast<unsigned long long>(bridgeId), timingVersion,
+        static_cast<unsigned long long>(frame.id),
+        static_cast<unsigned long long>(frame.desired),
+        static_cast<unsigned long long>(frame.plannedSubmit),
+        static_cast<unsigned long long>(frame.submitted),
+        static_cast<unsigned long long>(frame.shown),
+        static_cast<unsigned long long>(frame.latch),
+        static_cast<unsigned long long>(frame.queueEnd),
+        signedMs(frame.shown, frame.desired), signedMs(frame.desired, frame.submitted),
+        frame.lateLatch ? 1 : 0, frame.dropped ? 1 : 0);
+    if (length > 0)
+        std::cerr.write(line.data(), std::min<std::streamsize>(length, line.size() - 1));
+}
+
+void recordApplicationPresentWait(const VkDevice device, const VkSwapchainKHR swapchain,
+        const PresentWaitApi api, const uint64_t presentId, const uint64_t timeout,
+        const VkResult result, const Clock::time_point started,
+        const Clock::time_point finished) {
+    thread_local ApplicationPresentWait observations;
+    thread_local uint64_t waiterId = allocateContextId();
+    thread_local const auto threadId = gettid();
+    const auto window = observations.observe(device, swapchain, api,
+        presentId, timeout, result, started, finished);
+    if (!window)
+        return;
+    std::ostringstream line;
+    line << "MAKO Renderer: present diagnostics: operation=application-present-wait"
+         << " waiter=" << waiterId << " pid=" << getpid()
+         << " tid=" << threadId
+         << " sample_end_monotonic_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(finished.time_since_epoch()).count()
+         << " device=" << device << " swapchain=" << swapchain
+         << " api=" << (api == PresentWaitApi::Khr ? "KHR" : "KHR2")
+         << " calls=" << window->calls << " successful=" << window->successful
+         << " timeouts=" << window->timeouts << " errors=" << window->errors
+         << " polls=" << window->polls
+         << " first_present_id=" << window->firstPresentId
+         << " last_present_id=" << window->lastPresentId
+         << " duration_mean_ms=" << window->duration.mean()
+         << " duration_max_ms=" << window->duration.maximum;
+    if (window->firstFailure) {
+        const auto& failure = *window->firstFailure;
+        line << " first_failure_result=" << failure.result
+             << " first_failure_present_id=" << failure.presentId
+             << " first_failure_timeout_ns=" << failure.timeout
+             << " first_failure_duration_ms=" << failure.durationMs;
+    }
+    line << '\n';
+    std::cerr << line.str();
+}
+namespace {
+    std::atomic<uint32_t> nextContextSequence{1};
+    thread_local uint64_t activeContextId{0};
+
+    double elapsedMilliseconds(const Clock::time_point started) {
+        return std::chrono::duration<double, std::milli>(
+            Clock::now() - started
+        ).count();
+    }
+
+    void logAdaptiveStabilization(const std::string_view reason,
+            const Clock::duration duration) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation=adaptive-stabilization"
+                  << " context=" << activeContextId
+                  << " reason=" << reason
+                  << " duration_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         duration
+                     ).count()
+                  << '\n';
+    }
+
+    void logAdaptiveRamp(const size_t previousLimit, const size_t newLimit,
+            const double baseFps) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation=adaptive-ramp"
+                  << " context=" << activeContextId
+                  << " previous_generated_limit=" << previousLimit
+                  << " generated_limit=" << newLimit
+                  << " base_fps=" << baseFps << '\n';
+    }
+
+    void logAdaptiveRampResult(const bool accepted,
+            const size_t previousLimit, const size_t testedLimit,
+            const double previousBaseFps, const double currentBaseFps,
+            const double previousOutputFps, const double currentOutputFps,
+            const std::string_view reason) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation="
+                  << (accepted ? "adaptive-ramp-accepted" : "adaptive-load-shed")
+                  << " context=" << activeContextId
+                  << " previous_generated_limit=" << previousLimit
+                  << " tested_generated_limit=" << testedLimit
+                  << " previous_base_fps=" << previousBaseFps
+                  << " current_base_fps=" << currentBaseFps
+                  << " previous_output_fps=" << previousOutputFps
+                  << " current_output_fps=" << currentOutputFps;
+        if (!reason.empty())
+            std::cerr << " reason=" << reason;
+        std::cerr << '\n';
+    }
+
+    void logAdaptiveProbeAborted(const std::string_view reason,
+            const size_t testedLimit) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation=adaptive-probe-aborted"
+                  << " context=" << activeContextId
+                  << " reason=" << reason
+                  << " tested_generated_limit=" << testedLimit << '\n';
+    }
+
+    void logAdaptiveRearm(const std::string_view operation,
+            const std::string_view reason, const size_t failures,
+            const size_t fallbackLimit, const Clock::duration cooldown,
+            const double baselineBaseFps, const double currentBaseFps,
+            const std::string_view decision) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation=" << operation
+                  << " context=" << activeContextId
+                  << " reason=" << reason
+                  << " consecutive_failures=" << failures;
+        if (operation == "adaptive-rearm-scheduled") {
+            std::cerr << " cooldown_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             cooldown
+                         ).count()
+                      << " stable_required_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             AdaptiveScheduler::stableRearmDuration()
+                         ).count()
+                      << " fallback_generated_limit=" << fallbackLimit
+                      << " baseline_base_fps=" << baselineBaseFps;
+        } else {
+            std::cerr << " fallback_generated_limit=" << fallbackLimit
+                      << " baseline_base_fps=" << baselineBaseFps
+                      << " current_base_fps=" << currentBaseFps;
+            if (!decision.empty())
+                std::cerr << " decision=" << decision;
+        }
+        std::cerr << '\n';
+    }
+
+    void logAdaptiveFastCadenceBurst(const double baselineBaseFps,
+            const double instantaneousBaseFps, const double thresholdFps,
+            const size_t ignoredFrames, const size_t totalIgnoredFrames,
+            const Clock::duration duration) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation="
+                  << "adaptive-fast-cadence-burst"
+                  << " context=" << activeContextId
+                  << " baseline_base_fps=" << baselineBaseFps
+                  << " instantaneous_base_fps=" << instantaneousBaseFps
+                  << " threshold_fps=" << thresholdFps
+                  << " ignored_frames=" << ignoredFrames
+                  << " total_ignored_frames=" << totalIgnoredFrames
+                  << " duration_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         duration
+                     ).count()
+                  << '\n';
+    }
+
+    void logAdaptiveFastCadenceBurstComplete(
+            const size_t totalIgnoredFrames, const Clock::duration duration) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation="
+                  << "adaptive-fast-cadence-burst-complete"
+                  << " context=" << activeContextId
+                  << " total_ignored_frames=" << totalIgnoredFrames
+                  << " duration_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         duration
+                     ).count()
+                  << '\n';
+    }
+
+    void logAdaptiveRampBackoff(const size_t testedLimit,
+            const size_t failures, const double baselineBaseFps,
+            const Clock::duration delay) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation=adaptive-ramp-backoff"
+                  << " context=" << activeContextId
+                  << " tested_generated_limit=" << testedLimit
+                  << " consecutive_failures=" << failures
+                  << " baseline_base_fps=" << baselineBaseFps
+                  << " retry_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         delay
+                     ).count()
+                  << '\n';
+    }
+
+    void logAdaptiveRecoveryResume(const size_t generationLimit,
+            const Clock::duration higherProbeDelay,
+            const std::string_view reason) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation="
+                  << "adaptive-recovery-resume-scheduled"
+                  << " context=" << activeContextId
+                  << " generated_limit=" << generationLimit
+                  << " higher_probe_delay_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         higherProbeDelay
+                     ).count()
+                  << " reason=" << reason << '\n';
+    }
+
+    void logAdaptiveStableCadence(const std::string_view operation,
+            const size_t generatedLimit, const double baselineBaseFps,
+            const double currentBaseFps, const std::string_view reason) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation=" << operation
+                  << " context=" << activeContextId
+                  << " generated_limit=" << generatedLimit
+                  << " baseline_base_fps=" << baselineBaseFps
+                  << " current_base_fps=" << currentBaseFps
+                  << " projected_output_fps="
+                  << currentBaseFps * static_cast<double>(generatedLimit + 1);
+        if (!reason.empty())
+            std::cerr << " reason=" << reason;
+        std::cerr << '\n';
+    }
+
+    void logAdaptiveRescueStart(const size_t generatedLimit,
+            const double baselineBaseFps, const double currentBaseFps,
+            const double projectedOutputFps, const std::string_view reason) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation=adaptive-rescue-start"
+                  << " context=" << activeContextId
+                  << " generated_limit=" << generatedLimit
+                  << " baseline_base_fps=" << baselineBaseFps
+                  << " current_base_fps=" << currentBaseFps
+                  << " projected_output_fps=" << projectedOutputFps
+                  << " reason=" << reason
+                  << " measurement_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         AdaptiveScheduler::rescueMeasurementDuration()
+                     ).count()
+                  << '\n';
+    }
+
+    void logAdaptiveRescueComplete(const size_t previousLimit,
+            const size_t resumedLimit, const size_t requestedLimit,
+            const size_t configuredLimit, const double baselineBaseFps,
+            const double measuredBaseFps, const std::string_view decision) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation=adaptive-rescue-complete"
+                  << " context=" << activeContextId
+                  << " previous_generated_limit=" << previousLimit
+                  << " resumed_generated_limit=" << resumedLimit
+                  << " requested_generated_limit=" << requestedLimit
+                  << " configured_generated_limit=" << configuredLimit
+                  << " baseline_base_fps=" << baselineBaseFps
+                  << " measured_base_fps=" << measuredBaseFps
+                  << " decision=" << decision
+                  << " cooldown_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         AdaptiveScheduler::rescueCooldown()
+                     ).count()
+                  << '\n';
+    }
+
+    void logAdaptiveAutomaticBaseCapSuppressed(
+            const size_t generationLimit, const double baselineBaseFps,
+            const double currentBaseFps, const std::string_view reason) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation="
+                     "adaptive-auto-base-cap-suppressed"
+                  << " context=" << activeContextId
+                  << " generated_limit=" << generationLimit
+                  << " baseline_base_fps=" << baselineBaseFps
+                  << " current_base_fps=" << currentBaseFps
+                  << " reason=" << reason
+                  << " action=release-half-target-pacer-for-bounded-rescue"
+                  << '\n';
+    }
+
+    void logAdaptiveDiscontinuityRecoveryStart(
+            const size_t generationLimit, const double baselineBaseFps,
+            const std::string_view reason,
+            const Clock::duration maximumDuration) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation="
+                  << "adaptive-discontinuity-recovery-start"
+                  << " context=" << activeContextId
+                  << " generated_limit=" << generationLimit
+                  << " baseline_base_fps=" << baselineBaseFps
+                  << " reason=" << reason
+                  << " maximum_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         maximumDuration
+                     ).count()
+                  << '\n';
+    }
+
+    void logAdaptiveDiscontinuityRecoveryComplete(
+            const size_t generationLimit, const double baselineBaseFps,
+            const double measuredBaseFps, const std::string_view decision) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation="
+                  << "adaptive-discontinuity-recovery-complete"
+                  << " context=" << activeContextId
+                  << " generated_limit=" << generationLimit
+                  << " baseline_base_fps=" << baselineBaseFps
+                  << " measured_base_fps=" << measuredBaseFps
+                  << " decision=" << decision << '\n';
+    }
+
+    void logAdaptiveCadenceRefresh(const std::string_view reason,
+            const size_t retainedGenerationLimit, const size_t historyFrames) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation="
+                  << "adaptive-cadence-refresh"
+                  << " context=" << activeContextId
+                  << " reason=" << reason
+                  << " retained_generated_limit=" << retainedGenerationLimit
+                  << " history_warmup_frames=" << historyFrames
+                  << " policy=sdr-fast-resume\n";
+    }
+
+    void logDynamicCadenceRecovery(
+            const AdaptiveNativeCadenceProbeDiagnostic& probe) {
+        if (!enabled())
+            return;
+
+        // Build the record once so concurrent output cannot split it.
+        std::ostringstream line;
+        line << "MAKO Renderer: present diagnostics: operation="
+             << probe.operation
+             << " context=" << activeContextId
+             << " generated_limit=" << probe.generationLimit
+             << " baseline_base_fps=" << probe.baselineBaseFps
+             << " measured_base_fps=" << probe.measuredBaseFps
+             << " confirmed_samples=" << probe.confirmedSamples
+             << " native_frames=" << probe.nativeFrames
+             << " native_ms="
+             << std::chrono::duration_cast<std::chrono::milliseconds>(
+                    probe.nativeDuration
+                ).count()
+             << " reason=" << (probe.reason.empty()
+                 ? std::string_view{"none"} : probe.reason)
+             << " layer_share_max=";
+        if (probe.maximumLayerShare)
+            line << *probe.maximumLayerShare;
+        else
+            line << "unknown";
+        line << '\n';
+        std::cerr << line.str();
+    }
+
+    void logAdaptiveNearTargetNativePreference(
+            const std::string_view operation, const uint32_t targetFps,
+            const double baseFps, const double nativeIntervalRmsMilliseconds,
+            const double fractionalIntervalRmsMilliseconds,
+            const Clock::duration holdDuration,
+            const std::string_view reason) {
+        if (!enabled())
+            return;
+
+        std::cerr << "MAKO Renderer: present diagnostics: operation="
+                  << operation
+                  << " context=" << activeContextId
+                  << " target_fps=" << targetFps
+                  << " base_fps=" << baseFps
+                  << " predicted_native_interval_rms_ms="
+                  << nativeIntervalRmsMilliseconds
+                  << " predicted_fractional_interval_rms_ms="
+                  << fractionalIntervalRmsMilliseconds
+                  << " hold_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         holdDuration
+                     ).count()
+                  << " reason=" << reason
+                  << '\n';
+    }
+
+    class SchedulerDiagnostics final : public AdaptiveSchedulerDiagnostics {
+    public:
+        [[nodiscard]] bool enabled() const override {
+            return present_diagnostics::enabled();
+        }
+
+        void plan(const AdaptivePlanDiagnostic& plan) override {
+            if (!present_diagnostics::enabled())
+                return;
+
+            // std::cerr is unbuffered, so emitting every field directly adds
+            // repeated flush points to the presentation thread. Assemble the
+            // opt-in aggregate first and publish it as one complete record.
+            std::ostringstream message;
+            message << "MAKO Renderer: present diagnostics: operation=adaptive-plan"
+                    << " context=" << activeContextId
+                    << " base_fps=" << plan.baseFps
+                    << " target_fps=" << plan.targetFps
+                    << " generated=" << plan.generatedFrames
+                    << " max_generated=" << plan.maximumGeneratedFrames
+                    << " stable_cadence=" << (plan.stableCadence ? 1 : 0);
+            if (plan.nearTargetNativePreference) {
+                message << " near_target_native=1"
+                        << " predicted_native_interval_rms_ms="
+                        << plan.predictedNativeIntervalRmsMilliseconds
+                        << " predicted_fractional_interval_rms_ms="
+                        << plan.predictedFractionalIntervalRmsMilliseconds;
+            }
+            if (plan.configuredMaximumGeneratedFrames) {
+                message << " configured_max_generated="
+                        << plan.configuredMaximumGeneratedFrames;
+            }
+            if (!plan.phase.empty())
+                message << " phase=" << plan.phase;
+            if (plan.recoveryGenerationLimit) {
+                message << " recovery_generated_limit="
+                        << plan.recoveryGenerationLimit;
+            }
+            if (!plan.rearmReason.empty()) {
+                message << " rearm_reason=" << plan.rearmReason
+                        << " cooldown_remaining_ms="
+                        << std::chrono::duration_cast<std::chrono::milliseconds>(
+                               plan.rearmCooldownRemaining
+                           ).count()
+                        << " rearm_baseline_base_fps="
+                        << plan.rearmBaselineBaseFps;
+            }
+            if (plan.pacingSourceSamples) {
+                message << " target_clock="
+                        << (plan.targetOutputClockActive ? 1 : 0)
+                        << " target_budget_credit_outputs="
+                        << plan.targetOutputBudgetCreditOutputs
+                        << " target_deferred_budget_output="
+                        << (plan.targetOutputDeferredBudgetOutput ? 1 : 0)
+                        << " target_phase_error_ms="
+                        << plan.targetOutputPhaseErrorMilliseconds
+                        << " source_interval_samples="
+                        << plan.pacingSourceSamples
+                        << " source_interval_mean_ms="
+                        << plan.sourceIntervalMeanMilliseconds
+                        << " source_interval_stddev_ms="
+                        << plan.sourceIntervalStdDevMilliseconds
+                        << " source_interval_p95_ms="
+                        << plan.sourceIntervalP95Milliseconds
+                        << " source_interval_p99_ms="
+                        << plan.sourceIntervalP99Milliseconds
+                        << " generated_count_changes="
+                        << plan.generatedCountChanges
+                        << " requested_interval_samples="
+                        << plan.requestedIntervalSamples
+                        << " requested_interval_mean_ms="
+                        << plan.requestedIntervalMeanMilliseconds
+                        << " requested_interval_stddev_ms="
+                        << plan.requestedIntervalStdDevMilliseconds
+                        << " requested_interval_p95_ms="
+                        << plan.requestedIntervalP95Milliseconds
+                        << " requested_interval_p99_ms="
+                        << plan.requestedIntervalP99Milliseconds
+                        << " target_phase_error_samples="
+                        << plan.targetPhaseErrorSamples
+                        << " target_phase_error_rms_ms="
+                        << plan.targetPhaseErrorRmsMilliseconds
+                        << " target_phase_error_max_ms="
+                        << plan.targetPhaseErrorMaximumMilliseconds;
+            }
+            message << '\n';
+            std::cerr << message.str();
+        }
+
+        void stabilization(const std::string_view reason,
+                const Clock::duration duration) override {
+            logAdaptiveStabilization(reason, duration);
+        }
+
+        void ramp(const size_t previousLimit, const size_t newLimit,
+                const double baseFps) override {
+            logAdaptiveRamp(previousLimit, newLimit, baseFps);
+        }
+
+        void rampResult(const bool accepted, const size_t previousLimit,
+                const size_t testedLimit, const double previousBaseFps,
+                const double currentBaseFps, const double previousOutputFps,
+                const double currentOutputFps,
+                const std::string_view reason) override {
+            logAdaptiveRampResult(
+                accepted, previousLimit, testedLimit, previousBaseFps,
+                currentBaseFps, previousOutputFps, currentOutputFps, reason
+            );
+        }
+
+        void probeAborted(const std::string_view reason,
+                const size_t testedLimit) override {
+            logAdaptiveProbeAborted(reason, testedLimit);
+        }
+
+        void rearm(const std::string_view operation,
+                const std::string_view reason, const size_t failures,
+                const size_t fallbackLimit, const Clock::duration cooldown,
+                const double baselineBaseFps, const double currentBaseFps,
+                const std::string_view decision) override {
+            logAdaptiveRearm(
+                operation, reason, failures, fallbackLimit, cooldown,
+                baselineBaseFps, currentBaseFps, decision
+            );
+        }
+
+        void fastCadenceBurst(const double baselineBaseFps,
+                const double instantaneousBaseFps, const double thresholdFps,
+                const size_t ignoredFrames, const size_t totalIgnoredFrames,
+                const Clock::duration duration) override {
+            logAdaptiveFastCadenceBurst(
+                baselineBaseFps, instantaneousBaseFps, thresholdFps,
+                ignoredFrames, totalIgnoredFrames, duration
+            );
+        }
+
+        void fastCadenceBurstComplete(const size_t totalIgnoredFrames,
+                const Clock::duration duration) override {
+            logAdaptiveFastCadenceBurstComplete(totalIgnoredFrames, duration);
+        }
+
+        void rampBackoff(const size_t testedLimit, const size_t failures,
+                const double baselineBaseFps,
+                const Clock::duration delay) override {
+            logAdaptiveRampBackoff(
+                testedLimit, failures, baselineBaseFps, delay
+            );
+        }
+
+        void targetConstrained(const uint32_t targetFps,
+                const size_t maximumMultiplier, const double baseFps,
+                const double projectedOutputFps) override {
+            if (!present_diagnostics::enabled())
+                return;
+            std::cerr
+                << "MAKO Renderer: present diagnostics: "
+                << "operation=adaptive-target-constrained"
+                << " context=" << activeContextId
+                << " target_fps=" << targetFps
+                << " maximum_multiplier=" << maximumMultiplier
+                << " base_fps=" << baseFps
+                << " projected_output_fps=" << projectedOutputFps
+                << " reason=multiplier-ceiling"
+                << '\n';
+        }
+
+        void recoveryResume(const size_t generationLimit,
+                const Clock::duration higherProbeDelay,
+                const std::string_view reason) override {
+            logAdaptiveRecoveryResume(
+                generationLimit, higherProbeDelay, reason
+            );
+        }
+
+        void stableCadence(const std::string_view operation,
+                const size_t generatedLimit, const double baselineBaseFps,
+                const double currentBaseFps,
+                const std::string_view reason) override {
+            logAdaptiveStableCadence(
+                operation, generatedLimit, baselineBaseFps,
+                currentBaseFps, reason
+            );
+        }
+
+        void rescueStart(const size_t generatedLimit,
+                const double baselineBaseFps, const double currentBaseFps,
+                const double projectedOutputFps,
+                const std::string_view reason) override {
+            logAdaptiveRescueStart(
+                generatedLimit, baselineBaseFps, currentBaseFps,
+                projectedOutputFps, reason
+            );
+        }
+
+        void rescueComplete(const size_t previousLimit,
+                const size_t resumedLimit, const size_t requestedLimit,
+                const size_t configuredLimit, const double baselineBaseFps,
+                const double measuredBaseFps,
+                const std::string_view decision) override {
+            logAdaptiveRescueComplete(
+                previousLimit, resumedLimit, requestedLimit, configuredLimit,
+                baselineBaseFps, measuredBaseFps, decision
+            );
+        }
+
+        void automaticBaseCapSuppressed(const size_t generationLimit,
+                const double baselineBaseFps,
+                const double currentBaseFps,
+                const std::string_view reason) override {
+            logAdaptiveAutomaticBaseCapSuppressed(
+                generationLimit, baselineBaseFps, currentBaseFps, reason
+            );
+        }
+
+        void automaticBaseCapRestored(const size_t generationLimit,
+                const double baselineBaseFps, const double measuredBaseFps,
+                const std::string_view reason) override {
+            if (!enabled())
+                return;
+            std::cerr << "MAKO Renderer: present diagnostics: operation="
+                         "adaptive-auto-base-cap-restored"
+                      << " context=" << activeContextId
+                      << " generated_limit=" << generationLimit
+                      << " baseline_base_fps=" << baselineBaseFps
+                      << " measured_base_fps=" << measuredBaseFps
+                      << " reason=" << reason
+                      << " action=restore-half-target-pacer\n";
+        }
+
+        void discontinuityRecoveryStart(const size_t generationLimit,
+                const double baselineBaseFps, const std::string_view reason,
+                const Clock::duration maximumDuration) override {
+            logAdaptiveDiscontinuityRecoveryStart(
+                generationLimit, baselineBaseFps, reason, maximumDuration
+            );
+        }
+
+        void discontinuityRecoveryComplete(const size_t generationLimit,
+                const double baselineBaseFps, const double measuredBaseFps,
+                const std::string_view decision) override {
+            logAdaptiveDiscontinuityRecoveryComplete(
+                generationLimit, baselineBaseFps, measuredBaseFps, decision
+            );
+        }
+
+        void cadenceRefresh(const std::string_view reason,
+                const size_t retainedGenerationLimit,
+                const size_t historyFrames) override {
+            logAdaptiveCadenceRefresh(
+                reason, retainedGenerationLimit, historyFrames
+            );
+        }
+
+        void nativeCadenceProbe(
+                const AdaptiveNativeCadenceProbeDiagnostic& probe) override {
+            logDynamicCadenceRecovery(probe);
+        }
+
+        void nearTargetNativePreference(const std::string_view operation,
+                const uint32_t targetFps, const double baseFps,
+                const double nativeIntervalRmsMilliseconds,
+                const double fractionalIntervalRmsMilliseconds,
+                const Clock::duration holdDuration,
+                const std::string_view reason) override {
+            logAdaptiveNearTargetNativePreference(
+                operation, targetFps, baseFps,
+                nativeIntervalRmsMilliseconds,
+                fractionalIntervalRmsMilliseconds, holdDuration, reason
+            );
+        }
+    };
+}
+
+uint64_t allocateContextId() {
+    const auto processId = static_cast<uint64_t>(
+        static_cast<uint32_t>(::getpid())
+    );
+    const auto sequence = static_cast<uint64_t>(
+        nextContextSequence.fetch_add(1, std::memory_order_relaxed)
+    );
+    return (processId << 32) | sequence;
+}
+
+bool enabled() {
+    static const bool value = [] {
+        const char* environment = std::getenv("MAKO_PRESENT_DIAGNOSTICS");
+        return environment && std::string_view(environment) != "0";
+    }();
+    return value;
+}
+
+double thresholdMilliseconds() {
+    static const double threshold = [] {
+        constexpr double defaultThresholdMs = 20.0;
+        const char* value = std::getenv(
+            "MAKO_PRESENT_DIAGNOSTICS_THRESHOLD_MS"
+        );
+        if (!value)
+            return defaultThresholdMs;
+
+        char* end{};
+        const double parsed = std::strtod(value, &end);
+        if (end == value || *end != '\0' || parsed < 0.0)
+            return defaultThresholdMs;
+        return parsed;
+    }();
+    return threshold;
+}
+
+Clock::time_point start() {
+    if (!enabled())
+        return {};
+    return Clock::now();
+}
+
+ContextScope::ContextScope(const uint64_t contextId) :
+        previousContextId(activeContextId) {
+    activeContextId = contextId;
+}
+
+ContextScope::~ContextScope() {
+    activeContextId = this->previousContextId;
+}
+
+void logSlowOperation(const std::string_view operation,
+        const size_t frameIndex, const size_t sequenceIndex,
+        const Clock::time_point started,
+        const std::optional<VkResult> result,
+        const std::optional<size_t> passIndex,
+        const std::optional<uint32_t> imageIndex) {
+    if (!enabled())
+        return;
+
+    const double durationMs = elapsedMilliseconds(started);
+    const bool resultFailed = result &&
+        *result != VK_SUCCESS && *result != VK_SUBOPTIMAL_KHR;
+    if (durationMs < thresholdMilliseconds() && !resultFailed)
+        return;
+
+    std::ostringstream message;
+    message << "MAKO Renderer: present diagnostics: operation=" << operation
+            << " context=" << activeContextId
+            << " duration_ms=" << durationMs
+            << " frame=" << frameIndex
+            << " sequence=" << sequenceIndex;
+    if (result)
+        message << " result=" << static_cast<int>(*result);
+    if (passIndex)
+        message << " pass=" << *passIndex;
+    if (imageIndex)
+        message << " image=" << *imageIndex;
+    std::cerr << message.str() << '\n';
+}
+
+void logPresentFallback(const size_t frameIndex,
+        const size_t sequenceIndex, const size_t passIndex,
+        const size_t skippedFrames, const uint64_t timelineValue,
+        const std::string_view acquireMode,
+        const std::string_view backendWork) {
+    if (!enabled())
+        return;
+
+    std::cerr << "MAKO Renderer: present diagnostics: operation=skip-generated-frames"
+              << " context=" << activeContextId
+              << " frame=" << frameIndex
+              << " sequence=" << sequenceIndex
+              << " pass=" << passIndex
+              << " skipped=" << skippedFrames
+              << " wait_timeline=" << timelineValue
+              << " acquire_mode=" << acquireMode
+              << " backend_work=" << backendWork
+              << '\n';
+}
+
+void logHistoryWarmup(const size_t frameIndex,
+        const size_t sequenceIndex, const size_t remainingFrames,
+        const bool recovery,
+        const std::optional<uint32_t> acquiredImage) {
+    if (!enabled())
+        return;
+
+    std::cerr << "MAKO Renderer: present diagnostics: operation=history-warmup"
+              << " context=" << activeContextId
+              << " frame=" << frameIndex
+              << " sequence=" << sequenceIndex
+              << " reason=" << (recovery ? "recovery" : "startup")
+              << " remaining_frames=" << remainingFrames;
+    if (acquiredImage)
+        std::cerr << " released_image=" << *acquiredImage;
+    std::cerr << '\n';
+}
+
+AdaptiveSchedulerDiagnostics& adaptiveScheduler() {
+    static SchedulerDiagnostics diagnostics;
+    return diagnostics;
+}
+
+}

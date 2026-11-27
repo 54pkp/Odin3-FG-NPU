@@ -1,0 +1,16 @@
+{
+  "name": "Odin3 FG NPU",
+  "author": "54pkp",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": [
+      "npu",
+      "frame-generation",
+      "sm8750",
+      "odin3",
+      "hexagon-htp"
+    ],
+    "description": "Odin 3 SM8750 HTP v79 + Oryon NEON Tier-Matched Hybrid Frame Generation (360p-1080p, 120 Hz)"
+  }
+}

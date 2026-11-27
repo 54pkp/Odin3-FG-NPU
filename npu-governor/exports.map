@@ -1,0 +1,7 @@
+{
+  global:
+    QnnInterface_getProviders;
+    odin3_npu_governor_marker;
+  local:
+    *;
+};

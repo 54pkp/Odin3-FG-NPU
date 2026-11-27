@@ -1,0 +1,576 @@
+[
+  {
+    "width": 1280,
+    "height": 720,
+    "mode": "2x",
+    "tiers": {
+      "max": {
+        "median_ms": 8.52,
+        "p95_ms": 8.55,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 22,
+        "pillar_gain": 12.36
+      },
+      "high": {
+        "median_ms": 8.52,
+        "p95_ms": 8.55,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 22,
+        "pillar_gain": 12.36
+      },
+      "auto": {
+        "median_ms": 8.53,
+        "p95_ms": 8.56,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 22,
+        "pillar_gain": 12.36
+      },
+      "balanced": {
+        "median_ms": 7.1,
+        "p95_ms": 7.48,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 22,
+        "pillar_gain": 12.36
+      },
+      "saver": {
+        "median_ms": 8.52,
+        "p95_ms": 8.56,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 22,
+        "pillar_gain": 12.36
+      },
+      "eco": {
+        "median_ms": 9.63,
+        "p95_ms": 9.68,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 12.95
+      }
+    },
+    "scale_transitions": [
+      "Odin3 FG worker: pid=976028 action=odin3-tier-scale preset=max scale=720p native=1 phases=1 initial=1",
+      "Odin3 FG worker: pid=976028 action=odin3-tier-scale preset=eco scale=540p native=0 phases=1"
+    ],
+    "last_tier_status": {
+      "pid": 976028,
+      "preset_id": 0,
+      "preset": "eco",
+      "scale": "540p",
+      "scale_w": 960,
+      "scale_h": 540,
+      "native_w": 1280,
+      "native_h": 720,
+      "native": false,
+      "max_phases": 1,
+      "active_phases": 1,
+      "pair_ema_ms": 0.0,
+      "guard_cap": "1080p",
+      "ts_ns": 579168657199832
+    }
+  },
+  {
+    "width": 1280,
+    "height": 720,
+    "mode": "3x",
+    "tiers": {
+      "max": {
+        "median_ms": 13.37,
+        "p95_ms": 13.41,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 19,
+        "pillar_gain": 13.91
+      },
+      "high": {
+        "median_ms": 13.39,
+        "p95_ms": 13.41,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 19,
+        "pillar_gain": 13.91
+      },
+      "auto": {
+        "median_ms": 13.38,
+        "p95_ms": 13.48,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 19,
+        "pillar_gain": 13.91
+      },
+      "balanced": {
+        "median_ms": 13.37,
+        "p95_ms": 13.4,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 19,
+        "pillar_gain": 13.91
+      },
+      "saver": {
+        "median_ms": 13.34,
+        "p95_ms": 13.43,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 19,
+        "pillar_gain": 13.91
+      },
+      "eco": {
+        "median_ms": 8.01,
+        "p95_ms": 8.12,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 12.8
+      }
+    },
+    "dynamic_midpoint_in_3x": {
+      "max": {
+        "median_ms": 6.92,
+        "hud_max_err": 22,
+        "white_chroma": 0,
+        "pillar_gain": 12.36
+      },
+      "eco": {
+        "median_ms": 9.67,
+        "hud_max_err": 0,
+        "white_chroma": 0,
+        "pillar_gain": 12.95
+      }
+    },
+    "scale_transitions": [
+      "Odin3 FG worker: pid=976056 action=odin3-tier-scale preset=max scale=720p native=1 phases=2 initial=1",
+      "Odin3 FG worker: pid=976056 action=odin3-tier-scale preset=eco scale=360p native=0 phases=2",
+      "Odin3 FG worker: pid=976056 action=odin3-tier-scale preset=max scale=720p native=1 phases=2",
+      "Odin3 FG worker: pid=976056 action=odin3-tier-scale preset=eco scale=540p native=0 phases=2"
+    ],
+    "last_tier_status": {
+      "pid": 976056,
+      "preset_id": 0,
+      "preset": "eco",
+      "scale": "540p",
+      "scale_w": 960,
+      "scale_h": 540,
+      "native_w": 1280,
+      "native_h": 720,
+      "native": false,
+      "max_phases": 2,
+      "active_phases": 1,
+      "pair_ema_ms": 0.0,
+      "guard_cap": "1080p",
+      "ts_ns": 579170999084680
+    }
+  },
+  {
+    "width": 1600,
+    "height": 900,
+    "mode": "2x",
+    "tiers": {
+      "max": {
+        "median_ms": 9.43,
+        "p95_ms": 9.92,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 29,
+        "pillar_gain": 12.1
+      },
+      "high": {
+        "median_ms": 9.43,
+        "p95_ms": 9.87,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 29,
+        "pillar_gain": 12.1
+      },
+      "auto": {
+        "median_ms": 9.43,
+        "p95_ms": 9.89,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 29,
+        "pillar_gain": 12.1
+      },
+      "balanced": {
+        "median_ms": 10.9,
+        "p95_ms": 11.02,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 29,
+        "pillar_gain": 12.1
+      },
+      "saver": {
+        "median_ms": 9.56,
+        "p95_ms": 9.61,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 10.81
+      },
+      "eco": {
+        "median_ms": 9.68,
+        "p95_ms": 10.19,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 10.81
+      }
+    },
+    "scale_transitions": [
+      "Odin3 FG worker: pid=976088 action=odin3-tier-scale preset=max scale=900p native=1 phases=1 initial=1",
+      "Odin3 FG worker: pid=976088 action=odin3-tier-scale preset=saver scale=540p native=0 phases=1"
+    ],
+    "last_tier_status": {
+      "pid": 976088,
+      "preset_id": 1,
+      "preset": "saver",
+      "scale": "540p",
+      "scale_w": 960,
+      "scale_h": 540,
+      "native_w": 1600,
+      "native_h": 900,
+      "native": false,
+      "max_phases": 1,
+      "active_phases": 1,
+      "pair_ema_ms": 0.0,
+      "guard_cap": "1080p",
+      "ts_ns": 579172178866632
+    }
+  },
+  {
+    "width": 1600,
+    "height": 900,
+    "mode": "3x",
+    "tiers": {
+      "max": {
+        "median_ms": 15.94,
+        "p95_ms": 17.56,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 19,
+        "pillar_gain": 14.18
+      },
+      "high": {
+        "median_ms": 17.7,
+        "p95_ms": 17.84,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 19,
+        "pillar_gain": 14.18
+      },
+      "auto": {
+        "median_ms": 15.59,
+        "p95_ms": 15.69,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 11.19
+      },
+      "balanced": {
+        "median_ms": 16.72,
+        "p95_ms": 17.19,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 11.19
+      },
+      "saver": {
+        "median_ms": 12.99,
+        "p95_ms": 13.04,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 11.77
+      },
+      "eco": {
+        "median_ms": 9.03,
+        "p95_ms": 9.05,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 11.08
+      }
+    },
+    "dynamic_midpoint_in_3x": {
+      "max": {
+        "median_ms": 9.41,
+        "hud_max_err": 29,
+        "white_chroma": 0,
+        "pillar_gain": 12.1
+      },
+      "eco": {
+        "median_ms": 10.5,
+        "hud_max_err": 0,
+        "white_chroma": 0,
+        "pillar_gain": 10.81
+      }
+    },
+    "scale_transitions": [
+      "Odin3 FG worker: pid=976110 action=odin3-tier-scale preset=max scale=900p native=1 phases=2 initial=1",
+      "Odin3 FG worker: pid=976110 action=odin3-tier-scale preset=auto scale=720p native=0 phases=2",
+      "Odin3 FG worker: pid=976110 action=odin3-tier-scale preset=saver scale=540p native=0 phases=2",
+      "Odin3 FG worker: pid=976110 action=odin3-tier-scale preset=eco scale=360p native=0 phases=2",
+      "Odin3 FG worker: pid=976110 action=odin3-tier-scale preset=max scale=900p native=1 phases=2",
+      "Odin3 FG worker: pid=976110 action=odin3-tier-scale preset=eco scale=540p native=0 phases=2"
+    ],
+    "last_tier_status": {
+      "pid": 976110,
+      "preset_id": 0,
+      "preset": "eco",
+      "scale": "540p",
+      "scale_w": 960,
+      "scale_h": 540,
+      "native_w": 1600,
+      "native_h": 900,
+      "native": false,
+      "max_phases": 2,
+      "active_phases": 1,
+      "pair_ema_ms": 0.0,
+      "guard_cap": "1080p",
+      "ts_ns": 579175443515482
+    }
+  },
+  {
+    "width": 1920,
+    "height": 1080,
+    "mode": "2x",
+    "tiers": {
+      "max": {
+        "median_ms": 10.63,
+        "p95_ms": 10.69,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 12.96
+      },
+      "high": {
+        "median_ms": 10.57,
+        "p95_ms": 10.62,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 12.96
+      },
+      "auto": {
+        "median_ms": 10.72,
+        "p95_ms": 11.08,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 12.92
+      },
+      "balanced": {
+        "median_ms": 10.58,
+        "p95_ms": 10.67,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 12.92
+      },
+      "saver": {
+        "median_ms": 9.28,
+        "p95_ms": 9.34,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 12.76
+      },
+      "eco": {
+        "median_ms": 6.68,
+        "p95_ms": 6.76,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 7.61
+      }
+    },
+    "scale_transitions": [
+      "Odin3 FG worker: pid=976151 action=odin3-tier-scale preset=max scale=720p native=0 phases=1 initial=1",
+      "Odin3 FG worker: pid=976151 action=odin3-tier-scale preset=saver scale=540p native=0 phases=1",
+      "Odin3 FG worker: pid=976151 action=odin3-tier-scale preset=eco scale=360p native=0 phases=1"
+    ],
+    "last_tier_status": {
+      "pid": 976151,
+      "preset_id": 0,
+      "preset": "eco",
+      "scale": "360p",
+      "scale_w": 640,
+      "scale_h": 360,
+      "native_w": 1920,
+      "native_h": 1080,
+      "native": false,
+      "max_phases": 1,
+      "active_phases": 1,
+      "pair_ema_ms": 0.0,
+      "guard_cap": "1080p",
+      "ts_ns": 579177054394414
+    }
+  },
+  {
+    "width": 1920,
+    "height": 1080,
+    "mode": "3x",
+    "tiers": {
+      "max": {
+        "median_ms": 15.16,
+        "p95_ms": 15.21,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 14.72
+      },
+      "high": {
+        "median_ms": 15.18,
+        "p95_ms": 15.3,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 14.72
+      },
+      "auto": {
+        "median_ms": 15.15,
+        "p95_ms": 15.26,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 14.72
+      },
+      "balanced": {
+        "median_ms": 15.12,
+        "p95_ms": 15.18,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 14.72
+      },
+      "saver": {
+        "median_ms": 13.07,
+        "p95_ms": 13.17,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 12.23
+      },
+      "eco": {
+        "median_ms": 9.32,
+        "p95_ms": 9.38,
+        "white_chroma": 0,
+        "white_min": 255,
+        "black_max": 0,
+        "mono_chroma": 0,
+        "hud_max_err": 0,
+        "pillar_gain": 8.28
+      }
+    },
+    "dynamic_midpoint_in_3x": {
+      "max": {
+        "median_ms": 10.65,
+        "hud_max_err": 0,
+        "white_chroma": 0,
+        "pillar_gain": 12.96
+      },
+      "eco": {
+        "median_ms": 6.68,
+        "hud_max_err": 0,
+        "white_chroma": 0,
+        "pillar_gain": 7.61
+      }
+    },
+    "scale_transitions": [
+      "Odin3 FG worker: pid=976180 action=odin3-tier-scale preset=max scale=720p native=0 phases=2 initial=1",
+      "Odin3 FG worker: pid=976180 action=odin3-tier-scale preset=saver scale=540p native=0 phases=2",
+      "Odin3 FG worker: pid=976180 action=odin3-tier-scale preset=eco scale=360p native=0 phases=2",
+      "Odin3 FG worker: pid=976180 action=odin3-tier-scale preset=max scale=720p native=0 phases=2",
+      "Odin3 FG worker: pid=976180 action=odin3-tier-scale preset=eco scale=360p native=0 phases=2"
+    ],
+    "last_tier_status": {
+      "pid": 976180,
+      "preset_id": 0,
+      "preset": "eco",
+      "scale": "360p",
+      "scale_w": 640,
+      "scale_h": 360,
+      "native_w": 1920,
+      "native_h": 1080,
+      "native": false,
+      "max_phases": 2,
+      "active_phases": 1,
+      "pair_ema_ms": 0.0,
+      "guard_cap": "1080p",
+      "ts_ns": 579179678677521
+    }
+  }
+]

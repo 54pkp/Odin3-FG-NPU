@@ -1,0 +1,136 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+#pragma once
+
+#include "../helpers/pointers.hpp"
+#include "buffer.hpp"
+#include "descriptor_set.hpp"
+#include "image.hpp"
+#include "shader.hpp"
+#include "vulkan.hpp"
+
+#include <cstdint>
+#include <span>
+#include <utility>
+
+#include <vulkan/vulkan_core.h>
+
+namespace vk {
+
+    using Barrier = VkImageMemoryBarrier;
+
+    /// vulkan command buffer
+    class CommandBuffer {
+    public:
+        /// create a command buffer
+        /// @param vk the vulkan instance
+        /// @throws ls::vulkan_error on failure
+        CommandBuffer(const vk::Vulkan& vk);
+
+        /// begin recording commands
+        /// @param vk the vulkan instance
+        /// @param flags recording usage; use zero for sequential resubmission
+        /// @throws ls::vulkan_error on failure
+        void begin(const vk::Vulkan& vk,
+            VkCommandBufferUsageFlags flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) const;
+
+        /// blit an image
+        /// @param vk the vulkan instance
+        /// @param preBarriers image memory barriers to apply before blit
+        /// @param images source and destination images
+        /// @param extent the extent of the blit
+        /// @param postBarriers image memory barriers to apply after blit
+        /// throws ls::vulkan_error on failure
+        void blitImage(const vk::Vulkan& vk,
+            std::span<const vk::Barrier> preBarriers,
+            std::pair<VkImage, VkImage> images, VkExtent2D extent,
+            std::span<const vk::Barrier> postBarriers) const;
+
+        /// insert a bunch of barriers
+        /// @param vk the vulkan instance
+        /// @param barriers image memory barriers to apply
+        /// throws ls::vulkan_error on failure
+        void insertBarriers(const vk::Vulkan& vk,
+            std::span<const vk::Barrier> barriers) const;
+
+        /// dispatch a compute shader
+        /// @param vk the vulkan instance
+        /// @param shader the compute shader
+        /// @param set the descriptor set
+        /// @param barriers image memory barriers to apply
+        /// @param x dispatch size in X
+        /// @param y dispatch size in Y
+        /// @param z dispatch size in Z
+        void dispatch(const vk::Vulkan& vk, const vk::Shader& shader, const vk::DescriptorSet& set,
+            std::span<const vk::Barrier> barriers,
+            uint32_t x, uint32_t y, uint32_t z) const;
+
+        /// Apply compute dependencies for a group of independent dispatches.
+        void insertComputeBarriers(const vk::Vulkan& vk,
+            std::span<const vk::Barrier> barriers) const;
+        /// Dispatch after the caller has established all required dependencies.
+        void dispatchAfterBarrier(const vk::Vulkan& vk, const vk::Shader& shader,
+            const vk::DescriptorSet& set, uint32_t x, uint32_t y, uint32_t z) const;
+
+        /// copy buffer to image
+        /// @param vk the vulkan instance
+        /// @param buffer the source buffer
+        /// @param image the destination image
+        void copyBufferToImage(const vk::Vulkan& vk,
+            const vk::Buffer& buffer, const vk::Image& image) const;
+
+        /// copy an image into a host-visible transfer buffer
+        /// @param vk the vulkan instance
+        /// @param image the source image
+        /// @param buffer the destination buffer
+        void copyImageToBuffer(const vk::Vulkan& vk,
+            const vk::Image& image, const vk::Buffer& buffer) const;
+
+        /// end recording commands
+        /// @param vk the vulkan instance
+        /// @throws ls::vulkan_error on failure
+        void end(const vk::Vulkan& vk) const;
+
+        /// submit the command buffer
+        /// @param vk the vulkan instance
+        /// @param waitSemaphores the semaphores to wait on
+        /// @param waitTimelineSemaphore the timeline semaphore to wait on
+        /// @param waitValue the value to wait for
+        /// @param signalSemaphores the semaphores to signal
+        /// @param signalTimelineSemaphore the timeline semaphore to signal
+        /// @param signalValue the value to signal
+        /// @param fence optional fence to signal on completion
+        /// @throws ls::vulkan_error on failure
+        void submit(const vk::Vulkan& vk,
+            std::span<const VkSemaphore> waitSemaphores,
+            VkSemaphore waitTimelineSemaphore, uint64_t waitValue,
+            std::span<const VkSemaphore> signalSemaphores,
+            VkSemaphore signalTimelineSemaphore, uint64_t signalValue,
+            VkFence fence = VK_NULL_HANDLE,
+            VkQueue queue = VK_NULL_HANDLE) const;
+
+        /// Submit a nonempty sequence under one synchronization boundary.
+        /// Commands must contain the dependencies required between them.
+        static void submitCommands(const vk::Vulkan& vk,
+            std::span<const VkCommandBuffer> commands,
+            std::span<const VkSemaphore> waitSemaphores,
+            VkSemaphore waitTimelineSemaphore, uint64_t waitValue,
+            std::span<const VkSemaphore> signalSemaphores,
+            VkSemaphore signalTimelineSemaphore, uint64_t signalValue,
+            VkFence fence = VK_NULL_HANDLE,
+            VkQueue queue = VK_NULL_HANDLE);
+
+        /// submit the command buffer instantly
+        /// @param vk the vulkan instance
+        /// @throws ls::vulkan_error on failure
+        void submit(const vk::Vulkan& vk) const;
+
+        /// get the underlying command buffer for component-owned recording
+        /// sequences that need precise multi-stage synchronization
+        [[nodiscard]] VkCommandBuffer handle() const {
+            return *this->commandBuffer;
+        }
+    private:
+        ls::owned_ptr<VkCommandBuffer> commandBuffer;
+    };
+}
