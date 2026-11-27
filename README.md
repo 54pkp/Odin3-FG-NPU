@@ -1,45 +1,47 @@
 # Odin3-FG-NPU
 
-面向 **AYN Odin 3**（高通骁龙 8 至尊版 `SM8750`：Hexagon HTP v79 NPU + Oryon 八核 CPU + Adreno 830 GPU，运行 ArmadaOS / Gamescope）的本地 **Hexagon NPU 分档混合补帧**与 **NPU 动态功耗调速**双 Decky 插件及运行时。
+**English** | [简体中文](README.zh-CN.md)
 
-本项目通过 Vulkan 隐式层拦截游戏交换链，经由零拷贝 `DMA-BUF` 与独立推理进程 `odin3-fg-worker` 协同，在高通 Hexagon HTP v79 NPU 与 Oryon Phoenix-M 能效核（ARM64 NEON）上完成帧间插值，并通过 X11 DRI3 硬件 VBlank 相位锁定直出上屏，使补帧子进程的 **Adreno GPU 渲染负载保持 `0.00%`**，不抢占游戏的 GPU 着色器与显存带宽。
+Local **Hexagon NPU Tier-Matched Hybrid Frame Generation** and **Dynamic NPU Power Governor** Decky plugins and runtime for the **AYN Odin 3** (Qualcomm Snapdragon 8 Elite `SM8750`: Hexagon HTP v79 NPU + Oryon 8-core CPU + Adreno 830 GPU, running ArmadaOS / Gamescope).
 
----
-
-## 一、实机帧率表现与客观局限说明
-
-### 1. 锁定 120 Hz 实机吞吐表现
-
-在 Odin 3 实机 120 Hz 面板（校准 `120.03 Hz`）下，已对多款 2D/3D 游戏（*Return of the Obra Dinn*、*The Witness*、*The Talos Principle*、*Scarlet Hollow*、*Viewfinder*、*Queen's Domain*、*Life is Strange Remastered*、*Dead as Disco*、*TUNIC*）完成实测验证：
-
-- **2× 补帧（源帧上限 60 FPS → 120 Hz 输出）**：稳定输出 **`60 原生帧 + 60 生成帧 = 120 FPS`**（1:1 严格交替，漏补 `0`，重复帧 `0`）。
-- **3× 补帧（源帧上限 40 FPS → 120 Hz 输出）**：稳定输出 **`40 原生帧 + 80 生成帧 = 120 FPS`**（1:2 严格交替，漏补 `0`，重复帧 `0`）。
-- **不限源帧率（高原生帧场景）**：自动采用紧凑低开销推理与等距异步送屏，在避免拖慢原生帧率的前提下插入生成帧。
-
-![近期游玩游戏实测对比](docs/assets/recent_games_comparison.png)
-
-详细实机测试记录见 [`docs/benchmarks/`](docs/benchmarks/)。
-
-### 2. 当前画质与体感局限（重要说明）
-
-尽管帧数吞吐、原生帧保留率与功耗控制达到了设计指标，**当前版本的实际画面观感与镜头旋转流畅度仍存在明显不足**：
-
-1. **无引擎运动矢量与深度输入（纯盲插帧）**：作为外部 Vulkan 层通用插件，系统无法获取游戏内部的逐像素 Motion Vector、深度缓冲或摄像机矩阵，只能仅凭相邻两帧 `RGB` 图像推断运动。在**快速旋转 3D 镜头、大位移视差、复杂遮挡/反遮挡边缘**场景下，容易出现重影、几何边缘撕裂、果冻感或体感流畅度下降。
-2. **移动端 NPU 容量与定点量化限制**：为保证模型完全驻留 `SM8750` Hexagon HTP 的 8 MB VTCM 并在 `6–15 ms` 内完成推理，自研 **OmniShift** 网络采用纯卷积轻量结构与 `W8A8`（8-bit 权重 + 8-bit 激活）定点量化，对大跨度非刚性运动与复杂纹理的表达能力有限。
-3. **中低功耗档位混合超分闪烁**：在 `Eco (360p)`、`Saver (540p)`、`Balanced/Auto (720p)` 等档位下，生成帧以较低内部分辨率在 NPU 上推理后再经 CPU NEON 上采样与 `3×3` RCAS 锐化送屏；与 `1080p` 原生帧高频交替时，精细纹理处会出现奇偶帧清晰度差异带来的闪烁感。
-4. **动态半透明 UI 伪影**：静态 HUD 通过相邻帧差分掩码在全分辨率下保护，但随背景剧烈变化的半透明 UI、滚动文字或细密网格仍可能产生局部伪影。
-
-本仓库完整公开当前插件、Vulkan 层、HTP/NEON 混合工作进程以及 PyTorch 训练与 QNN HTP 离线编译代码，供查阅、复现或继续改进。
+By hooking the game's Vulkan swapchain through an implicit layer, sharing zero-copy `DMA-BUF` descriptors with an out-of-process worker (`odin3-fg-worker`), executing frame interpolation across the Hexagon HTP v79 NPU and Oryon Phoenix-M efficiency cores (ARM64 NEON), and presenting directly via X11 DRI3 hardware VBlank phase-locking, the frame generation worker keeps **Adreno GPU rendering load at `0.00%`** without competing for the game's GPU shaders or VRAM bandwidth.
 
 ---
 
-## 二、使用说明
+## 1. Live Throughput & Honest Visual Limitations
 
-### 1. 环境与前置要求
+### 1.1 Locked 120 Hz Live Throughput
 
-- **设备与系统**：AYN Odin 3（`SM8750` / `aarch64`），运行 ArmadaOS（Steam 游戏模式 + Gamescope + Decky Loader）。
-- **高通 QAIRT 运行时库（需自行准备）**：
-  本仓库及 GitHub Release **不包含任何高通专有闭源 SDK 库文件**。运行前请从 Qualcomm AI Engine Direct (QAIRT / QNN SDK，需支持 Hexagon HTP `v79`) 提取以下运行库并放置到 `~/.local/share/odin3-fg/qairt/`（也可从设备系统已有的高通 QNN 运行目录复制）：
+Verified on an Odin 3 handheld with its 120 Hz DSI panel calibrated to `120.03 Hz` across multiple 2D/3D titles (*Return of the Obra Dinn*, *The Witness*, *The Talos Principle*, *Scarlet Hollow*, *Viewfinder*, *Queen's Domain*, *Life is Strange Remastered*, *Dead as Disco*, and *TUNIC*):
+
+- **2× Frame Generation (`60 FPS` source cap → `120 Hz` output)**: Sustains **`60 native frames + 60 generated frames = 120 FPS`** (`1:1` strict cadence, `0` missed pairs, `0` repeated frames).
+- **3× Frame Generation (`40 FPS` source cap → `120 Hz` output)**: Sustains **`40 native frames + 80 generated frames = 120 FPS`** (`1:2` strict cadence, `0` missed pairs, `0` repeated frames).
+- **Uncapped Source Frame Rate (High Native FPS)**: Automatically switches to compact low-overhead inference and equidistant asynchronous presentation so generated frames are inserted without dragging down native FPS.
+
+![Live Multi-Game Benchmark Comparison](docs/assets/recent_games_comparison.png)
+
+Detailed silicon and live game benchmark records are available in [`docs/benchmarks/`](docs/benchmarks/).
+
+### 1.2 Current Visual Quality & Motion Limitations (Important)
+
+While frame throughput, native frame retention, and NPU power scaling meet their engineering targets, **visual quality and perceived smoothness during fast camera motion still have significant limitations**:
+
+1. **No Engine Motion Vectors or Depth Buffers (Blind RGB Interpolation)**: As a game-agnostic external Vulkan layer, the plugin has no access to per-pixel engine motion vectors, depth buffers, or camera matrices, relying solely on two consecutive `RGB` frames. During **fast 3D camera rotation, wide parallax pans, and complex occlusion/disocclusion boundaries**, visible ghosting, edge tearing, warping ("jelly" artifacts), and reduced perceived smoothness occur.
+2. **Mobile NPU Memory & Fixed-Point Quantization Constraints**: To keep activations fully resident inside the `SM8750` Hexagon HTP's 8 MB on-chip VTCM within a tight `6–15 ms` pair budget, the self-trained **OmniShift** network uses a lightweight pure-convolutional architecture quantized to `W8A8` (8-bit weights, 8-bit activations), limiting its capacity on large non-rigid displacements and intricate textures.
+3. **Sub-Resolution Upscaling Shimmering on Lower Power Tiers**: Under `Eco (360p)`, `Saver (540p)`, and `Balanced/Auto (720p)`, generated frames are inferred at reduced internal resolution on the NPU and upsampled via CPU NEON + `3×3` RCAS sharpening. Alternating sub-resolution generated frames with crisp `1080p` native frames at 120 Hz introduces noticeable odd/even-frame sharpness flickering on fine details.
+4. **Dynamic Translucent UI Artifacts**: Static HUD elements are preserved at full native resolution via frame-difference masking, whereas semi-transparent animated UI, scrolling text, or fine grids moving over dynamic backgrounds can still exhibit local artifacts.
+
+This repository open-sources the complete Decky plugins, Vulkan layer, HTP/NEON hybrid worker, PyTorch training pipeline, and QNN HTP offline compilation scripts for reference, reproduction, and further research.
+
+---
+
+## 2. Installation & Usage Guide
+
+### 2.1 Prerequisites
+
+- **Hardware & OS**: AYN Odin 3 (`SM8750` / `aarch64`) running ArmadaOS (Steam Game Mode + Gamescope + Decky Loader).
+- **Qualcomm QAIRT Runtime Libraries (User-Provided)**:
+  Neither this repository nor its GitHub Releases distribute proprietary Qualcomm SDK binaries. Before running, extract the Hexagon HTP `v79` runtime libraries from Qualcomm AI Engine Direct (QAIRT / QNN SDK, or copy them from existing QNN runtime directories on the device) into `~/.local/share/odin3-fg/qairt/`:
 
   ```text
   ~/.local/share/odin3-fg/qairt/
@@ -47,35 +49,35 @@
   │   ├── libQnnHtp.so
   │   ├── libQnnSystem.so
   │   ├── libQnnHtpV79Stub.so
-  │   └── libQnnHtpPrepare.so   # 可选
+  │   └── libQnnHtpPrepare.so   # optional
   └── hexagon/
       └── libQnnHtpV79Skel.so
   ```
 
-### 2. 安装步骤
+### 2.2 Installation Steps
 
-从本仓库 [Releases](https://github.com/54pkp/Odin3-FG-NPU/releases) 下载以下四个文件并传入掌机（例如放在 `/tmp/`）：
+Download the four release archives from [Releases](https://github.com/54pkp/Odin3-FG-NPU/releases) and copy them to your Odin 3 (for example, into `/tmp/`):
 
-- `odin3-fg-runtime.tar`（开源 Vulkan 层 + `odin3-fg-worker` + FastRPC 运行包）
-- `omnishift-sm8750-models.tar.gz`（自训练 5 分辨率 `360p–1080p` OmniShift HTP v79 模型包）
-- `odin3-fg-npu-decky.zip`（补帧控制 Decky 插件）
-- `odin3-npu-power-decky.zip`（NPU 功耗/性能调速 Decky 插件）
+- `odin3-fg-runtime.tar` (open-source Vulkan layer + `odin3-fg-worker` + FastRPC runtime bundle)
+- `omnishift-sm8750-models.tar.gz` (self-trained 5-scale `360p–1080p` OmniShift HTP v79 context binaries)
+- `odin3-fg-npu-decky.zip` (frame generation Decky plugin)
+- `odin3-npu-power-decky.zip` (NPU power/performance governor Decky plugin)
 
-在 Odin 3 终端（SSH 或桌面终端，默认用户 `armada`）依次执行：
+Run the following commands in an Odin 3 terminal (SSH or Desktop Konsole, default user `armada`):
 
 ```bash
-# 1. 创建数据目录并解压 5 档位 HTP 模型包
+# 1. Extract the 5-scale HTP model bundle
 mkdir -p ~/.local/share/odin3-fg/models
 tar -xzf /tmp/omnishift-sm8750-models.tar.gz -C ~/.local/share/odin3-fg/models
 
-# 2. 部署版本化运行时管理器并激活运行包
+# 2. Install the versioned runtime manager and activate the runtime archive
 cp runtime/install_runtime.py ~/.local/share/odin3-fg/install_runtime.py
 RT_SHA=$(sha256sum /tmp/odin3-fg-runtime.tar | awk '{print $1}')
 python3 -I ~/.local/share/odin3-fg/install_runtime.py stage /tmp/odin3-fg-runtime.tar --sha256 "$RT_SHA"
 python3 -I ~/.local/share/odin3-fg/install_runtime.py activate "$RT_SHA" -- \
     /usr/bin/test -x ~/.local/share/odin3-fg/versions/"$RT_SHA"/odin3-fg-worker
 
-# 3. 安装两个 Decky 插件并重启 Decky 服务
+# 3. Install both Decky plugins and restart Decky Loader
 sudo unzip -oq /tmp/odin3-fg-npu-decky.zip -d ~/homebrew/plugins/
 sudo unzip -oq /tmp/odin3-npu-power-decky.zip -d ~/homebrew/plugins/
 sudo chown -R "$USER:$USER" ~/homebrew/plugins/odin3-fg-npu
@@ -85,47 +87,47 @@ sudo chmod 0755 ~/homebrew/plugins/odin3-fg-npu/py_modules/odin3_fg_launch.py \
 sudo systemctl restart plugin_loader.service
 ```
 
-> 也可以直接在 Steam 游戏模式的 **Decky 设置 → 开发者 → 从 ZIP 文件安装插件** 中分别选择 `odin3-fg-npu-decky.zip` 与 `odin3-npu-power-decky.zip` 安装。
+> Alternatively, both `.zip` plugins can be installed from Steam Game Mode via **Decky Settings → Developer → Install Plugin from ZIP File**.
 
-### 3. 游戏内开启与档位调节
+### 2.3 In-Game Configuration & Power Tiers
 
-1. **先启动一次目标游戏或停留在目标游戏详情页**，按下掌机快捷菜单键打开 Decky 插件栏，进入 **`Odin3 FG NPU`**：
-   - **补帧倍率**：
-     - `关闭（原生直通）`：自动移除补帧启动项，游戏完全按原设置运行。
-     - `2× 分档混合补帧`：适合原生能稳定达到 `60 FPS` 的游戏，补帧至 `120 FPS`。
-     - `3× 分档混合补帧`：适合原生能稳定达到 `40 FPS` 的游戏，补帧至 `120 FPS`。
-   - **源帧率上限**：
-     - 希望锁定 `120 Hz` 等距平滑送屏并启用高内部分辨率模型时，建议在 `2×` 下选 **`60`**、在 `3×` 下选 **`40`**。
-     - 若选择 **`不限（原生无损）`**，高帧率游戏不强制锁帧，自动使用超低延迟 `360p` 紧凑档辅助插帧。
-   - **目标屏幕刷新率**：默认 `120 Hz`（启动游戏时自动同步 Gamescope 刷新率并在退出游戏后还原）。
-   - 修改补帧开关或源帧上限后**需重启当前游戏生效**（插件会自动在 Steam 启动项中写入或移除 `~/.local/share/odin3-fg/bin/odin3-fg-launch %command%`）。
-   - 游戏内请**关闭 HDR** 以及游戏自带的其他帧生成功能。
+1. **Open the target game's Steam page (or launch it once)**, press the Quick Access Menu (QAM) button, and open **`Odin3 FG NPU`**:
+   - **Multiplier**:
+     - `Off (Native Passthrough)`: Automatically removes the launcher token and runs the game untouched.
+     - `2× Hybrid FG`: Recommended for games sustaining `>= 60 FPS` native (`60 → 120 FPS`).
+     - `3× Hybrid FG`: Recommended for games sustaining `>= 40 FPS` native (`40 → 120 FPS`).
+   - **Source FPS Cap**:
+     - For locked `120 Hz` VBlank-paced output and higher internal NPU scales, select **`60`** for `2×` or **`40`** for `3×`.
+     - Selecting **`Uncapped`** leaves high-FPS games uncapped and automatically runs ultra-low-latency `360p` compact interpolation.
+   - **Target Refresh Rate**: Defaults to `120 Hz` (automatically syncs Gamescope's refresh rate on launch and restores the previous setting on exit).
+   - **Restart the game** after changing the multiplier or source FPS cap (the plugin automatically injects or removes `~/.local/share/odin3-fg/bin/odin3-fg-launch %command%` in Steam Launch Options).
+   - **Disable in-game HDR** and any built-in frame generation inside the game's own graphics settings.
 
-2. 打开 **`Odin3 NPU 性能调节`（`Odin3 NPU Power`）** 选择 NPU 功耗与画质档位（**对正在运行的游戏即时热生效，无需重启游戏**）：
+2. Open **`Odin3 NPU Power`** in QAM to switch NPU power/performance presets (**hot-applied immediately to running games without restarting**):
 
-| NPU 档位 | HTP 核心电压角上限 | 总线电压角上限 | 锁定 120 Hz 下匹配的内部推理分辨率（1080p 交换链） | 适用场景 |
+| NPU Preset | HTP Core Corner Cap | Bus Corner Cap | Matched Internal Scale at Locked 120 Hz (`1080p` Swapchain) | Typical Use Case |
 | :--- | :--- | :--- | :--- | :--- |
-| **`Eco`（省电静音档）** | `SVS / SVS+` | `SVS` | `640×360`（`360p` 混合超分） | 最低整机功耗与发热，适合续航优先 |
-| **`Saver`（能效优先档）** | `NOM+` | `NOM` | `960×540`（`540p` 混合超分） | 明显降低 NPU 与 LPDDR5X 带宽功耗 |
-| **`Balanced`（均衡甜点档）** | `TURBO` | `NOM+` | `1280×720`（`720p` 混合超分） | 兼顾清晰度、延迟与发热 |
-| **`Auto`（智能动态档，推荐）** | 动态 `NOM ~ MAX` | 动态 `SVS+ ~ TURBO+` | `1280×720`（`720p` 混合超分） | 按实时推理占空比自动升降压并保留帧间深度休眠 |
-| **`High`（高性能档）** | `MAX`（帧间休眠） | `NOM+` | `1600×900`（`900p` 混合超分） | 高清晰度推理且允许帧间关断 HMX |
-| **`Max`（满血极限档）** | `MAX` | `NOM+` | `1600×900`（`900p` 混合超分） | 最高 NPU 算力档位（若交换链本身为 `720p/900p` 则直接原生零缩放推理） |
-| **`Passthrough`（原厂不干预）** | 客户端默认投票 | 客户端默认投票 | 最高可用档位 | 旁路电压调节器 |
+| **`Eco`** | `SVS / SVS+` | `SVS` | `640×360` (`360p` hybrid upscale) | Lowest system power & heat; maximum battery life |
+| **`Saver`** | `NOM+` | `NOM` | `960×540` (`540p` hybrid upscale) | Substantial NPU & LPDDR5X bus power reduction |
+| **`Balanced`** | `TURBO` | `NOM+` | `1280×720` (`720p` hybrid upscale) | Balanced sharpness, latency, and thermals |
+| **`Auto` (Recommended)** | Dynamic `NOM ~ MAX` | Dynamic `SVS+ ~ TURBO+` | `1280×720` (`720p` hybrid upscale) | Scales voltage dynamically by live duty cycle with inter-frame sleep |
+| **`High`** | `MAX` (with sleep) | `NOM+` | `1600×900` (`900p` hybrid upscale) | High-resolution inference while retaining inter-frame HMX power-down |
+| **`Max`** | `MAX` | `NOM+` | `1600×900` (`900p` hybrid upscale) | Maximum NPU headroom (runs native zero-scale on `720p/900p` swapchains) |
+| **`Passthrough`** | Client default vote | Client default vote | Highest available scale | Bypasses governor voltage overrides |
 
-### 4. 版本回滚与卸载
+### 2.4 Rollback & Uninstallation
 
 ```bash
-# 回滚到上一个激活的运行时版本
+# Roll back to the previously active runtime release
 python3 -I ~/.local/share/odin3-fg/install_runtime.py rollback
 
-# 查看当前激活版本状态
+# Check active runtime digest
 python3 -I ~/.local/share/odin3-fg/install_runtime.py status
 ```
 
-如需彻底卸载：
-1. 在 `Odin3 FG NPU` 中将开启过补帧的游戏切回 `关闭（原生直通）`（或删除启动项中的 `~/.local/share/odin3-fg/bin/odin3-fg-launch`；即便保留该启动项，在运行时目录删除后它也会自动无损透传原游戏命令）。
-2. 还原 QAIRT 原始库并清理插件与数据目录：
+To completely uninstall:
+1. Set any enabled games back to `Off` inside `Odin3 FG NPU` (even if `~/.local/share/odin3-fg/bin/odin3-fg-launch` remains in a game's Launch Options, it safely execs the original game command once the runtime directory is removed).
+2. Restore the original `libQnnHtp.so` and remove the plugins and state directories:
    ```bash
    if [[ -f ~/.local/share/odin3-fg/qairt/lib/libQnnHtp.real.so ]]; then
        mv -f ~/.local/share/odin3-fg/qairt/lib/libQnnHtp.real.so ~/.local/share/odin3-fg/qairt/lib/libQnnHtp.so
@@ -143,138 +145,138 @@ python3 -I ~/.local/share/odin3-fg/install_runtime.py status
 
 ---
 
-## 三、上游技术与开源致谢
+## 3. Upstream Technologies & Open-Source Credits
 
-当前补帧插件与工具链实际基于以下上游项目与平台技术构建（详见 [`sources.json`](sources.json) 与 [`licenses/`](licenses/)）：
+This project builds directly upon the following upstream projects and platform technologies (see [`sources.json`](sources.json) and [`licenses/`](licenses/)):
 
-1. **[MAKO](https://github.com/eugeniosegala/MAKO)**（`GPL-3.0-or-later`，源自 **[lsfg-vk](https://github.com/PancakeTAS/lsfg-vk)**）：
-   提供 Vulkan 隐式层骨架（`VK_LAYER_MAKO_render` / `libmako-render.so`）、交换链生命周期管理以及渲染层与外部帧生成进程之间的 Unix `SOCK_SEQPACKET` + Vulkan Timeline Semaphore 通信框架。本项目在此基础上实现了零拷贝 WSI `DMA-BUF` 捕获、X11 DRI3 硬件 VBlank 相位锁定送屏、多 `VkInstance`/`VkDevice` 并发分发表保护以及 Hexagon HTP 共享缓冲调度协议。
-2. **[Qualcomm FastRPC](https://github.com/qualcomm/fastrpc)**（`BSD-3-Clause`）与 **Qualcomm QAIRT / QNN HTP SDK**：
-   使用开源 `cdsprpcd` 与 `libcdsprpc.so` 建立 Linux 用户态与 `SM8750` Hexagon cDSP 的 FastRPC 会话及零拷贝 `DMA-BUF` 内存注册，通过 QNN HTP `v79` 接口加载执行离线编译的上下文二进制图（`.bin`），并通过 `QnnHtpPerfInfrastructure`（`DCVS_V3`）控制核心/总线电压角、RPC 唤醒延迟与 HMX 断电超时。
-3. **[Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader)**（`BSD-3-Clause`）：
-   提供 Steam 游戏模式快捷菜单插件框架；Steam `localconfig.vdf` 启动项无损同步逻辑参考了社区 `decky-lsfg-vk` 的设计思路。
-4. **Gamescope / Mesa Turnip Vulkan WSI / X11 DRI3 & Present 扩展**：
-   利用 Mesa X11 WSI 在交换链创建时的 DRI3 `DMA-BUF` 导出接口与 Gamescope `:0` 的 `PresentPixmapSynced` 显式同步原语，直接将原生帧与生成帧按硬件 VBlank 节拍交替送显。
-5. **[Khronos Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers)**（`Apache-2.0`）与 **[LibYAML](https://github.com/yaml/libyaml)**（`MIT`）：
-   分别用于 Vulkan 层交叉编译与 FastRPC 库构建。
-6. **PyTorch & ONNX**：
-   用于自研纯卷积插帧网络 **OmniShift** 的训练、W8A8 量化感知微调（QAT）及静态 NHWC 计算图导出。
+1. **[MAKO](https://github.com/eugeniosegala/MAKO)** (`GPL-3.0-or-later`, descended from **[lsfg-vk](https://github.com/PancakeTAS/lsfg-vk)**):
+   Provides the Vulkan implicit layer foundation (`VK_LAYER_MAKO_render` / `libmako-render.so`), swapchain lifecycle hooks, and out-of-process Unix `SOCK_SEQPACKET` + Vulkan Timeline Semaphore IPC framework. Extended in this project with 12-slot zero-copy WSI `DMA-BUF` capture, X11 DRI3 hardware VBlank PLL presentation, thread-safe multi-`VkInstance`/`VkDevice` dispatch routing, and Hexagon HTP shared-buffer scheduling.
+2. **[Qualcomm FastRPC](https://github.com/qualcomm/fastrpc)** (`BSD-3-Clause`) & **Qualcomm QAIRT / QNN HTP SDK**:
+   Uses open-source `cdsprpcd` and `libcdsprpc.so` for Linux userspace-to-cDSP communication and zero-copy `DMA-BUF` mapping on `SM8750`, QNN HTP `v79` APIs to execute offline-compiled context binaries (`.bin`), and `QnnHtpPerfInfrastructure` (`DCVS_V3`) for core/bus voltage voting, RPC latency control, and HMX power-gating timeouts.
+3. **[Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader)** (`BSD-3-Clause`):
+   Provides the Steam Game Mode Quick Access Menu plugin host; token-preserving Steam `localconfig.vdf` Launch Options synchronization draws inspiration from `decky-lsfg-vk`.
+4. **Gamescope / Mesa Turnip Vulkan WSI / X11 DRI3 & Present Extensions**:
+   Leverages Mesa X11 WSI DRI3 `DMA-BUF` export during swapchain creation and Gamescope `:0` `PresentPixmapSynced` explicit timeline synchronization for hardware VBlank-paced presentation.
+5. **[Khronos Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers)** (`Apache-2.0`) & **[LibYAML](https://github.com/yaml/libyaml)** (`MIT`):
+   Used for cross-compiling the Vulkan layer and building FastRPC.
+6. **PyTorch & ONNX**:
+   Used to train the custom pure-convolutional **OmniShift** interpolation network, run Stage-2 `W8A8` Quantization-Aware Training (QAT), and export static NHWC graphs.
 
 ---
 
-## 四、技术说明（系统架构详解）
+## 4. Technical Architecture
 
 ```mermaid
 flowchart LR
-    subgraph GameProc["游戏进程 (Proton / FEX / Native Vulkan)"]
-        WSI["libodin3-wsi-dma-capture.so<br/>12槽线性 DMA-BUF 零拷贝捕获"]
-        Layer["libmako-render.so<br/>Vulkan 隐式层 + Prime 核(cpu6..7)隔离"]
-        Presenter["odin3-present 线程 (cpu1..5)<br/>X11 DRI3 120Hz VBlank PLL / ASYNC 送屏"]
+    subgraph GameProc["Game Process (Proton / FEX / Native Vulkan)"]
+        WSI["libodin3-wsi-dma-capture.so<br/>12-Slot Linear DMA-BUF Zero-Copy Capture"]
+        Layer["libmako-render.so<br/>Vulkan Implicit Layer + Prime Core (cpu6..7) Pinning"]
+        Presenter["odin3-present Thread (cpu1..5)<br/>X11 DRI3 120Hz VBlank PLL / ASYNC Presenter"]
         WSI --> Layer --> Presenter
     end
 
-    subgraph WorkerProc["独立进程 odin3-fg-worker (cpu1..5, 0% GPU)"]
-        Scaler["Oryon NEON 混合重采样器<br/>EL0 dc civac + 抗锯齿下采样 + RCAS + HUD保护"]
-        QNN["QNN HTP v79 管线<br/>OmniShift 360p–1080p 上下文 (.bin)"]
-        Gov["libodin3-npu-governor.so<br/>libQnnHtp 拦截 + Seqlock DCVS v3 调速"]
+    subgraph WorkerProc["Out-of-Process odin3-fg-worker (cpu1..5, 0% GPU)"]
+        Scaler["Oryon NEON Hybrid Resampler<br/>EL0 dc civac + AA Downsample + RCAS + HUD Guard"]
+        QNN["QNN HTP v79 Pipeline<br/>OmniShift 360p–1080p Contexts (.bin)"]
+        Gov["libodin3-npu-governor.so<br/>libQnnHtp Interposer + Seqlock DCVS v3 Governor"]
         Scaler <--> QNN --> Gov
     end
 
-    subgraph Hardware["SM8750 硬件子系统"]
+    subgraph Hardware["SM8750 Silicon Subsystems"]
         NPU["Hexagon HTP v79 (8MB VTCM / HMX)"]
-        Disp["Gamescope X11 DRI3 / 120.03Hz DSI 面板"]
+        Disp["Gamescope X11 DRI3 / 120.03Hz DSI Panel"]
     end
 
-    Layer -- "Unix Seqpacket + 12源/6输出 DMA-BUF FD<br/>+ Timeline Semaphore" --> Scaler
+    Layer -- "Unix Seqpacket + 12 Src / 6 Out DMA-BUF FDs<br/>+ Timeline Semaphore" --> Scaler
     Gov -- "FastRPC (libcdsprpc.so)" --> NPU
     Presenter -- "PresentPixmapSynced" --> Disp
 ```
 
-### 1. 零拷贝 WSI `DMA-BUF` 捕获桥（`engine/wsi-dma-capture/`）
+### 4.1 Zero-Copy WSI `DMA-BUF` Capture Bridge (`engine/wsi-dma-capture/`)
 
-传统 Vulkan 补帧层需要每帧在游戏图形队列上额外执行一次全屏 `vkCmdCopyImage` 将交换链图像复制到外部共享内存，在 `1080p` 高帧率下会引入显著的 GPU 带宽开销与队列同步气泡。
+Conventional Vulkan frame generation layers inject a full-screen `vkCmdCopyImage` on the game's graphics queue every frame to export swapchain images into shared memory, adding GPU memory traffic and pipeline stalls at `1080p`.
 
-本项目的 `libodin3-wsi-dma-capture.so` 在游戏创建交换链的瞬态窗口内拦截 `xcb_dri3_get_supported_modifiers_reply` 与 `xcb_dri3_pixmap_from_buffers_checked`，优先协商线性 `DRM_FORMAT_MOD_LINEAR` 修饰符并直接复制出 12 个底层交换链图像的 `DMA-BUF` 文件描述符。游戏渲染完成后仅通过零命令缓冲的空队列提交中继 `VkTimelineSemaphore`，即可将同一块物理内存同时用于：
-- X11 DRI3 原生帧零拷贝直接送屏；
-- `odin3-fg-worker` 直接读取并生成中间帧。
+`libodin3-wsi-dma-capture.so` intercepts `xcb_dri3_get_supported_modifiers_reply` and `xcb_dri3_pixmap_from_buffers_checked` during swapchain creation, negotiates `DRM_FORMAT_MOD_LINEAR` when supported, and duplicates the 12 underlying swapchain `DMA-BUF` file descriptors. Once the game finishes rendering a frame, an empty queue submit relays `VkTimelineSemaphore` signaling with zero post-draw image copies, sharing the exact same physical memory across:
+- Zero-copy X11 DRI3 native frame scanout; and
+- Direct NPU/NEON read access inside `odin3-fg-worker`.
 
-对于不支持线性修饰符直通的交换链，渲染层自动回退到预录制并按槽位缓存的 `VK_PIPELINE_STAGE_TRANSFER_BIT` 异步传输池，不在图形管线顶部插入全管线阻塞屏障。
+When a swapchain does not support linear modifier export, the layer falls back to pre-recorded per-slot `VK_PIPELINE_STAGE_TRANSFER_BIT` async copy command buffers without top-of-pipe full-GPU barriers.
 
-### 2. X11 DRI3 硬件 VBlank 相位锁定（PLL）送屏调度（`engine/mako-render/`）
+### 4.2 X11 DRI3 Hardware VBlank PLL Presenter (`engine/mako-render/`)
 
-`independent_real_present.cpp` 与 `direct_x11_present.hpp` 在独立线程 `odin3-present` 中绕过游戏的 `vkQueuePresentKHR` 阻塞路径，直接通过 XCB `PresentPixmapSynced` 向 Gamescope 提交 12 个原生帧槽位与 6 个生成帧槽位：
+`independent_real_present.cpp` and `direct_x11_present.hpp` decouple presentation from the game's `vkQueuePresentKHR` thread, driving 12 native slots and 6 generated slots directly via XCB `PresentPixmapSynced` on a dedicated `odin3-present` thread:
 
-- **锁定 120 Hz VBlank PLL 模式**：利用 DRI3 `PresentCompleteNotify` 返回的硬件翻页微秒时间戳（`ust`）与计数器（`msc`）建立锁相环，在每个 `8.33 ms` VBlank 周期的 **22% 相位点**精确锚定节拍，严格按 `G -> O`（`2×`）或 `G1 -> G2 -> O`（`3×`）顺序锁定目标 `target_msc` 提交。
-- **`3×` 动态单/双相位自适应**：在 `3×` 模式下，同一个 HTP 上下文同时挂载双相位解码图（`phase13.bin` + `phase23.bin`）与中点解码图（`phase12.bin`）。当锁定 40 FPS 源帧时运行完整双相位（`1:2` 输出 120 FPS）；当不锁帧且源帧率高于 ~55 FPS 时自动切为单相位中点插帧，避免双相位超时丢帧。
-- **不锁帧等距 `ASYNC` 模式**：当用户未限制源帧率且原生帧率已超过面板半帧率时，自动启用 `XCB_PRESENT_OPTION_ASYNC` 等距无回压送屏，防止垂直同步队列反压降低游戏原生帧率。
-- **面板刷新率热校准**：Odin 3 出厂 DSI `frame_len_120=76` 实际刷新率约为 `118.96 Hz`，会导致 60/40 FPS 锁帧产生周期性拍频微卡顿；`Odin3 FG NPU` 后端自动将其校准至 `56`（实测 `120.02–120.14 Hz`）。
+- **Locked 120 Hz VBlank PLL Mode**: Locks onto hardware page-flip timestamps (`ust`) and counters (`msc`) from DRI3 `PresentCompleteNotify` events, anchoring submission deadlines at **22% of each `8.33 ms` VBlank period** and targeting explicit `target_msc` slots in strict `G -> O` (`2×`) or `G1 -> G2 -> O` (`3×`) order.
+- **Dynamic 1-Phase / 2-Phase Adaptation in `3×` Contexts**: Each `3×` HTP pipeline loads both dual-phase decoders (`phase13.bin` + `phase23.bin`) and a midpoint decoder (`phase12.bin`). At 40 FPS capped input it executes full dual-phase `1:2` synthesis (`120 FPS`); when uncapped native FPS rises above ~55 FPS, it seamlessly drops to single-phase `t=0.5` midpoint synthesis within the same context to prevent deadline overruns.
+- **Uncapped Equidistant `ASYNC` Mode**: When uncapped native FPS exceeds half the display refresh rate, presentation switches to `XCB_PRESENT_OPTION_ASYNC` so VSync queue backpressure never throttles native game performance.
+- **DSI Panel 120 Hz Calibration**: The Odin 3 factory DSI `frame_len_120=76` runs at `~118.96 Hz`, causing periodic beat-frequency stutter against a 60/40 FPS cap; `Odin3 FG NPU` automatically calibrates it to `56` (`120.02–120.14 Hz` across operating temperatures).
 
-### 3. OmniShift 纯卷积多尺度光流插帧网络（`training/omnishift_vfi.py`）
+### 4.3 OmniShift Pure-Convolutional Multi-Scale VFI Network (`training/omnishift_vfi.py`)
 
-针对 `SM8750` Hexagon HTP v79 硬件特性专门设计并从头训练的端到端纯卷积插帧模型（零自定义 HVX/DSP 算子、零 `GridSample` 回退）：
+An end-to-end pure-convolutional optical-flow interpolation model purpose-built and trained from scratch for `SM8750` Hexagon HTP v79 (zero custom HVX/DSP ops, zero `GridSample` fallbacks):
 
-- **HTP 64 通道张量块对齐与全 VTCM 驻留**：内部特征通道严格对齐 64 的整数倍（`48/64/96/192/384`），中间激活全部驻留在 8 MB 片上 VTCM 内，避免频繁读写 LPDDR5X。
-- **零偏置对称 `[0, 1]` `YBGR24` 编解码器**：通过 `4×4` Space-to-Depth 将输入拆解为 16 通道 `1×1` 全分辨率亮度 `Y_p` 与 8 通道 `2×4` 半块平均 `B_h, G_h, R_h, Y_h`，解码端按无偏置恒等式 `C_p = C_h + Y_p - Y_h` 重构。纯黑 `[0,0,0]` 输入全通道精确为零；单色/1-bit 点阵画面（`B == G == R`）在位移后四组半块色度权重逐位一致，严格保持零色差。
-- **精确互补合一分区权重（`w0 = 1 - sum(wnz)`）与无彩线边界复制**：在粗粒度三元位移层（`ExactComplementTernaryCoarse24`）与细粒度 8 抽头 `[-4, +4] px` 帐篷核层（`ExactComplementTent8Tap4px24`）中，静止权重 `w0` 直接由量化后的非零位移权重 `wnz` 互补求得，保证任意光流边界处权重之和恒等于 `255/255 = 1.0`，消除纯白 `[255,255,255]` 量化崩裂；全部空间卷积采用显式边缘复制填充（`replicate_pad_2d`），彻底消除屏幕底边彩色溢出线。
-- **多图拆分架构**：每个分辨率档位包含 5 个离线编译上下文：
-  - `vfi-joined.bin`：原生分辨率 `2×`（`t=0.5`）单次融合推理图；
-  - `vfi-motion3x.bin`：双帧共享对称光流与遮挡潜变量编码器（每对源帧仅运行 1 次）；
-  - `phase12.bin` / `phase13.bin` / `phase23.bin`：分别对应 `t=1/2`、`t=1/3`、`t=2/3` 的轻量相位合成解码器。
+- **64-Channel HMX Tile Alignment & Full VTCM Residency**: Internal channel counts (`48/64/96/192/384`) align to Hexagon HMX tile multiples so intermediate activations remain inside the 8 MB VTCM without spilling to LPDDR5X.
+- **Zero-Offset Symmetric `[0, 1]` `YBGR24` Subpixel Codec**: Unpacks `4×4` blocks into 16 full-resolution `1×1` luma channels (`Y_p`) plus 8 `2×4` half-block average chroma/luma channels (`B_h, G_h, R_h, Y_h`), reconstructing via bias-free `C_p = C_h + Y_p - Y_h`. Pure black `[0,0,0]` maps to exact zero across all channels, and monochrome / 1-bit dithered scenes (`B == G == R`) apply bit-identical shift weights across all four half-block groups for zero color cast.
+- **Exact-Complement Partition-of-Unity (`w0 = 1 - sum(wnz)`) & Border-Safe Padding**: Both ternary coarse shift layers (`ExactComplementTernaryCoarse24`) and 8-tap `[-4, +4] px` fine tent layers (`ExactComplementTent8Tap4px24`) compute the stationary weight `w0` directly as the complement of quantized non-zero tap weights `wnz`, guaranteeing `q(w0) + sum(q(wnz)) == 255/255 == 1.0` across flow contours (eliminating pure-white `[255,255,255]` quantization shattering), while explicit edge replication (`replicate_pad_2d`) eliminates bottom-border color bleed.
+- **Split Multi-Graph Bundle**: Each resolution scale ships 5 precompiled HTP context binaries:
+  - `vfi-joined.bin`: Fused single-graph `2×` (`t=0.5`) native-scale network;
+  - `vfi-motion3x.bin`: Shared symmetric motion & occlusion latent encoder (executed once per frame pair);
+  - `phase12.bin` / `phase13.bin` / `phase23.bin`: Lightweight phase synthesis decoders for `t=1/2`, `t=1/3`, and `t=2/3`.
 
-### 4. Oryon 大小核隔离与 ARM64 NEON 混合重采样引擎（`worker/odin3_tier_engine.hpp`）
+### 4.4 Oryon Cluster Isolation & ARM64 NEON Hybrid Resampler (`worker/odin3_tier_engine.hpp`)
 
-`SM8750` 拥有 6 颗 `3.53 GHz` Phoenix-M 核心（`cpu0..5`）与 2 颗 `4.09 GHz` Phoenix-L 超大核（`cpu6..7`）：
+`SM8750` pairs six `3.53 GHz` Phoenix-M cores (`cpu0..5`) with two `4.09 GHz` Phoenix-L Prime cores (`cpu6..7`):
 
-- **双簇严格隔离**：渲染层后台监控游戏线程 CPU 时间片，自动将最重的 1–2 个游戏主渲染线程固定至 `cpu6..7` 超大核；同时将 `odin3-present` 与 `odin3-fg-worker`（含 NEON 线程池）限制在 `cpu1..5`（避开承载系统中断的 `cpu0`），确保补帧计算零抢占游戏超大核。
-- **用户态 EL0 `dc civac` 按行缓存维护**：直接对 `mmap` 的系统 `DMA-BUF` 虚拟地址按实际采样行执行 ARM64 `dc civac` 指令，无需陷入内核执行整帧 `DMA_BUF_IOCTL_SYNC` 等待显卡 `dma_resv` 栅栏。
-- **NEON 抗锯齿下采样 + 无振铃 RCAS + 静态 HUD 无损融合**：
-  - 下采样支持 `2×2` Box（`1080p→540p`）、带非临时流式写指令 `stnp` 的精确 `3:2` 盒式滤波（`1080p→720p`）与 `3×3` Tent 抗锯齿核（`1080p→360p`），抑制旋转镜头下的高频摩尔纹混叠；
-  - 上采样在单遍扫描内融合双线性插值、自适应无振铃 `3×3` RCAS 局部对比度锐化（按功耗档位调节锐化上限并抑制方向性块振铃）以及全分辨率静态 HUD / 单色保护（检测 `|A - B|` 静止像素直接取全清原生像素）；
-  - 在 `3×` 混合超分模式下，子线程异步执行 `P().render(1)`（第 2 相位 NPU 推理）与主线程 `upsampleOutput(0)`（第 1 相位 NEON 上采样）完全并行重叠。
+- **Strict Dual-Cluster Isolation**: The layer monitors per-thread CPU ticks in the game process and pins the 1–2 heaviest game rendering threads onto Prime `cpu6..7`, while confining `odin3-present` and `odin3-fg-worker` (including NEON worker threads) to `cpu1..5` (avoiding IRQ-heavy `cpu0`) so frame generation never preempts Prime cores.
+- **Userspace EL0 `dc civac` Sampled-Row Cache Maintenance**: Executes ARM64 `dc civac` cache invalidation directly on `mmap`ped `DMA-BUF` rows actually read by the downsampler, avoiding full-frame kernel `DMA_BUF_IOCTL_SYNC` stalls on GPU `dma_resv` fences.
+- **NEON Anti-Aliased Downsampling, Ring-Free RCAS & Static HUD Protection**:
+  - Downsampling uses `2×2` Box (`1080p→540p`), exact `3:2` box filtering with non-temporal `stnp` stores (`1080p→720p`), and `3×3` Tent anti-aliasing (`1080p→360p`) to suppress camera-pan aliasing;
+  - Single-pass upsampling fuses bilinear interpolation, tier-adaptive ring-free `3×3` RCAS contrast sharpening, and full-resolution static HUD/monochrome protection (preserving native `1080p` pixels where `|A - B|` is static);
+  - In scaled `3×` mode, a background worker thread overlaps `P().render(1)` (second-phase NPU execution) concurrently with `upsampleOutput(0)` (first-phase CPU NEON upsampling).
 
-### 5. `libQnnHtp.so` 拦截调速器与温控保护（`npu-governor/npu_governor_shim.cpp`）
+### 4.5 `libQnnHtp.so` Seqlock Power Governor & HMX Thermal Guard (`npu-governor/npu_governor_shim.cpp`)
 
-由于 `SM8750` NPU 在 Linux 内核下不暴露通用 `devfreq` 调频节点，所有频率、电压角与休眠均由用户态通过 QNN `DCVS_V3` 投票决定：
+Because the `SM8750` Hexagon NPU exposes no Linux kernel `devfreq` node, clocks, voltage corners, and sleep states are voted from user space via QNN `DCVS_V3`:
 
-- `libodin3-npu-governor.so` 以同名 `libQnnHtp.so` 形式前置加载，包装 `QnnInterface_getProviders`、`deviceGetInfrastructure` 与 `graphExecute`；
-- 强制下发 `RPC_POLLING_TIME = 0`，禁止高通宿主库在 ARM CPU 上忙轮询等待 DSP 完成，使 CPU 在推理期间进入 `WFI` 休眠；
-- 每次推理前以无锁原子指令轮询 `/run/odin3-npu-governor/config.bin` 的 128 字节 Seqlock 配置块，实现零重启热切换电压角，并向 `/run/odin3-npu-governor/telemetry/` 输出实时推理帧率、单次耗时、占空比与电压档位遥测；
-- `odin3-fg-worker` 同步监测 `nsphmx` 热区温度，在超过 `85°C / 88°C / 90.5°C` 时自动限制最高内部分辨率档位，防止长时间满载过热降频。
+- `libodin3-npu-governor.so` loads in front of Qualcomm's library as `libQnnHtp.so`, wrapping `QnnInterface_getProviders`, `deviceGetInfrastructure`, and `graphExecute`;
+- Enforces `RPC_POLLING_TIME = 0` so host ARM64 threads enter `WFI` sleep instead of busy-spinning during cDSP execution;
+- Polls a shared 128-byte `mmap` seqlock configuration (`/run/odin3-npu-governor/config.bin`) before each inference for zero-restart voltage corner hot-switching and writes live FPS, latency, duty cycle, and corner telemetry to `/run/odin3-npu-governor/telemetry/`;
+- `odin3-fg-worker` monitors `nsphmx` thermal zones and proactively steps down the maximum internal resolution cap across `85°C / 88°C / 90.5°C` thresholds to prevent thermal throttling.
 
 ---
 
-## 五、仓库目录结构与源码构建
+## 5. Repository Structure & Building from Source
 
 ```text
 Odin3-FG-NPU/
-├── engine/                 # Vulkan 隐式层 (libmako-render.so) 与零拷贝 WSI 捕获库 (libodin3-wsi-dma-capture.so)
-│   ├── mako-common/        # Vulkan 封装、配置与 htp_deadline 运行参数
-│   ├── mako-backend/       # 独立 worker 进程管理与共享 DMA-BUF 调度协议
-│   ├── mako-render/        # 交换链钩子、X11 DRI3 VBlank PLL 送屏器与 Oryon 线程编排
-│   └── wsi-dma-capture/    # xcb-dri3 线性修饰符协商与 DMA-BUF 导出拦截层
-├── worker/                 # 独立进程补帧引擎 (odin3-fg-worker)：QNN HTP v79 管线 + Oryon NEON 混合重采样器
-├── npu-governor/           # libQnnHtp.so 动态电压/休眠拦截层 (libodin3-npu-governor.so)
-├── runtime/                # 版本化运行时安装器 (install_runtime.py)、启动包装器 (odin3-fg.sh) 与配置管理
-├── decky-fg/               # Decky 插件：Odin3 FG NPU（游戏级补帧配置与面板校准）
-├── decky-npu-power/        # Decky 插件：Odin3 NPU Power（实时 NPU 档位调节与功耗/温度遥测）
-├── training/               # OmniShift PyTorch 网络定义、FP32+W8A8 QAT 训练脚本与 QNN HTP v79 5尺度编译脚本
-├── scripts/                # 一键交叉编译打包脚本 (build_all.py) 与验收校验脚本 (check_acceptance.py)
-├── docs/                   # 实机测试对比图与基准测试 JSON 记录
-├── licenses/               # 上游开源组件许可证文本 (MAKO / FastRPC / LibYAML)
-└── sources.json            # 实际使用的上游开源仓库与锁定提交哈希
+├── engine/                 # Vulkan implicit layer (libmako-render.so) & zero-copy WSI capture (libodin3-wsi-dma-capture.so)
+│   ├── mako-common/        # Vulkan wrappers, configuration, and htp_deadline runtime parameters
+│   ├── mako-backend/       # Out-of-process worker lifecycle & shared DMA-BUF scheduling protocol
+│   ├── mako-render/        # Swapchain hooks, X11 DRI3 VBlank PLL presenter & Oryon thread Affinity
+│   └── wsi-dma-capture/    # xcb-dri3 linear modifier negotiation & DMA-BUF export interposer
+├── worker/                 # Out-of-process worker (odin3-fg-worker): QNN HTP v79 pipeline + Oryon NEON resampler
+├── npu-governor/           # libQnnHtp.so dynamic DCVS v3 voltage/sleep interposer (libodin3-npu-governor.so)
+├── runtime/                # Versioned runtime installer (install_runtime.py), wrapper (odin3-fg.sh) & profile CLI
+├── decky-fg/               # Decky plugin: Odin3 FG NPU (per-game FG profiles & 120Hz panel calibration)
+├── decky-npu-power/        # Decky plugin: Odin3 NPU Power (live NPU power presets & thermal/power telemetry)
+├── training/               # OmniShift PyTorch architecture, FP32+W8A8 QAT trainer & 5-scale QNN HTP compiler
+├── scripts/                # Cross-compile & packaging script (build_all.py) and benchmark verifier (check_acceptance.py)
+├── docs/                   # Live benchmark comparison chart & sanitized benchmark JSON reports
+├── licenses/               # Upstream open-source license texts (MAKO / FastRPC / LibYAML)
+└── sources.json            # Pinned upstream open-source repositories and commit hashes
 ```
 
-### 1. 交叉编译运行时与 Decky 插件
+### 5.1 Cross-Compiling the Runtime & Decky Plugins
 
-构建依赖：
+Build prerequisites:
 - Python `>= 3.11`
-- [Zig](https://ziglang.org/) `>= 0.14`（提供 `aarch64-linux-gnu` C/C++ 交叉编译器）
-- Node.js `>= 18`（用于构建两个 Decky 插件的 TypeScript/React 前端）
-- Khronos `Vulkan-Headers`、`aarch64` Linux/X11/XCB/DRM 系统头文件及 `libvulkan.so.1` 链接桩
-- Qualcomm QAIRT SDK 的 `include/QNN` 头文件目录
-- 开源编译好的 `aarch64` `qualcomm/fastrpc` 二进制（`cdsprpcd`、`libcdsprpc.so`、`libcdsp_default_listener.so.1`）
+- [Zig](https://ziglang.org/) `>= 0.14` (used as the `aarch64-linux-gnu` C/C++ cross-compiler)
+- Node.js `>= 18` (for building the TypeScript/React Decky plugin frontends)
+- Khronos `Vulkan-Headers`, `aarch64` Linux/X11/XCB/DRM sysroot headers, and an `aarch64` `libvulkan.so.1` link stub
+- Qualcomm QAIRT SDK `include/QNN` headers
+- Prebuilt open-source `aarch64` `qualcomm/fastrpc` binaries (`cdsprpcd`, `libcdsprpc.so`, `libcdsp_default_listener.so.1`)
 
-设置路径环境变量后一键构建全部产物（输出至 `dist-release/`）：
+Set the toolchain environment variables and run `scripts/build_all.py` (outputs to `dist-release/`):
 
 ```bash
 export ODIN3_ZIG=/path/to/zig
@@ -287,16 +289,16 @@ export ODIN3_FASTRPC_DIR=/path/to/fastrpc-aarch64
 python scripts/build_all.py --models-dir /path/to/omnishift-sm8750
 ```
 
-### 2. 训练 OmniShift 模型并编译 SM8750 HTP 二进制
+### 5.2 Training OmniShift & Compiling SM8750 HTP Context Binaries
 
 ```bash
-# 1. 训练 FP32 + Stage-2 W8A8 QAT 模型（传入 [N, 3, H, W, 3] uint8 BGR 三元组 .npy 数据集）
+# 1. Train Stage-1 FP32 + Stage-2 W8A8 QAT model on [N, 3, H, W, 3] uint8 BGR frame triplets (.npy)
 python training/train_omnishift.py \
     --data-npy /path/to/triplets.npy \
     --out-dir runs/omnishift_sm8750 \
     --steps 20000 --qat-start 15000
 
-# 2. 导出 5 尺度 (360p/540p/720p/900p/1080p) ONNX 图并调用 QAIRT 编译为 HTP v79 上下文 (.bin)
+# 2. Export 5-scale (360p/540p/720p/900p/1080p) ONNX graphs and compile HTP v79 context binaries (.bin)
 python training/export_and_compile_htp.py \
     --ckpt runs/omnishift_sm8750/omnishift_vfi_sm8750.pt \
     --qairt-sdk /path/to/qairt/2.x \
@@ -305,6 +307,6 @@ python training/export_and_compile_htp.py \
 
 ---
 
-## 六、许可证
+## 6. License
 
-本仓库源码基于 **[GNU General Public License v3.0 or later (`GPL-3.0-or-later`)](LICENSE)** 发布。第三方开源组件的原始许可证见 [`licenses/`](licenses/) 目录。Qualcomm QAIRT / QNN SDK 为高通专有软件，不在本仓库分发范围内，请遵循高通官方许可条款自行获取使用。
+This repository's source code is licensed under the **[GNU General Public License v3.0 or later (`GPL-3.0-or-later`)](LICENSE)**. Upstream open-source component licenses are located in [`licenses/`](licenses/). Qualcomm QAIRT / QNN SDK is proprietary software owned by Qualcomm Technologies, Inc. and is not distributed in this repository; obtain and use it in accordance with Qualcomm's license terms.
